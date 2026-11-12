@@ -1,0 +1,28 @@
+# Local development: `make run` on the host or the docker compose stack.
+#
+# Placeholders: ${VAR} is required, ${VAR:-default} falls back when VAR is
+# unset or empty. Quote placeholders that must stay strings (secrets!).
+app:
+  name: vyking-3p-integration-service
+  env: local
+
+log:
+  level: ${LOG_LEVEL:-debug}
+  format: ${LOG_FORMAT:-text}
+
+server:
+  shutdown_timeout: 40s
+  drain_delay: 0s # nothing routes traffic to a laptop
+  public:
+    enabled: ${PUBLIC_ENABLED:-true}
+    addr: "${PUBLIC_ADDR:-:8080}"
+    read_header_timeout: 5s
+    read_timeout: 10s
+    write_timeout: 15s
+    idle_timeout: 60s
+  internal:
+    addr: "${INTERNAL_ADDR:-:9090}"
+    read_header_timeout: 5s
+    read_timeout: 10s
+    write_timeout: 15s
+    idle_timeout: 60s

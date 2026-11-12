@@ -1,1 +1,13 @@
-.idea
+# IDE
+.idea/
+.vscode/
+
+# Build and test artifacts
+/bin/
+coverage.out
+*.test
+*.prof
+
+# Local environment overrides (never commit real credentials)
+.env
+.env.*

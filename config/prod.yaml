@@ -1,0 +1,27 @@
+# prod environment. Mounted as a ConfigMap in Kubernetes; secrets are
+# injected as environment variables and referenced as ${VAR} placeholders.
+app:
+  name: vyking-3p-integration-service
+  env: prod
+
+log:
+  level: ${LOG_LEVEL:-info}
+  format: json
+
+server:
+  # terminationGracePeriodSeconds must exceed drain_delay + shutdown_timeout.
+  shutdown_timeout: 45s
+  drain_delay: 5s # let the endpoints controller remove the pod first
+  public:
+    enabled: ${PUBLIC_ENABLED:-true}
+    addr: ":8080"
+    read_header_timeout: 5s
+    read_timeout: 10s
+    write_timeout: 15s
+    idle_timeout: 60s
+  internal: # ClusterIP only, never exposed through the ingress
+    addr: ":9090"
+    read_header_timeout: 5s
+    read_timeout: 10s
+    write_timeout: 15s
+    idle_timeout: 60s
