@@ -32,6 +32,23 @@ make clean   # stop and delete the data volume for a fresh start
 
 To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
 
+## Partner authentication
+
+The partner API expects `Authorization: Bearer <token>`, where the token is an HS256 JWT issued by us that lists the brands
+the partner may access (details and alternatives in [NOTES.md](NOTES.md#partner-authentication-deliberately-unspecified-by-the-task)).
+Tokens for local testing are signed with the key from the active config:
+
+```sh
+make -s tokens                                    # TOKEN_VALID_BRAND_1=..., TOKEN_EXPIRED=..., TOKEN_ALG_NONE=..., ...
+eval "$(make -s tokens)"                          # export them into the shell
+go run ./scripts/tokengen -brands 1,2 -ttl 24h    # a single custom token
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `AUTH_KEY_ID`, `AUTH_JWT_SECRET` | current verification key (`kid` + secret, ≥ 32 bytes) |
+| `AUTH_PREVIOUS_KEY_ID`, `AUTH_PREVIOUS_JWT_SECRET` | previous key, kept during rotation (optional) |
+
 ## Sample data
 
 `make seed` loads deterministic sample data into the compose database (it connects as MySQL root because it writes

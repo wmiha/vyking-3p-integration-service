@@ -36,6 +36,55 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
 - **Start-up.** The service waits up to `database.startup_timeout` for its pools before opening listeners, then exits
   non-zero, which makes a misconfiguration visible as a crash loop instead of a pod that is silently never ready.
 
+### Partner authentication (deliberately unspecified by the task)
+
+The task only says Acme Support calls us with `Authorization: Bearer <partner-token>` and that a partner must only access
+the brands it is authorized for. It says nothing about the token format, who issues it, its lifetime, how it is revoked
+or how Acme obtains it. This is the least specified part of the integration, so the decision is isolated: handlers depend
+on a one-method `TokenVerifier` interface and the scheme can be replaced without touching them.
+
+**Assumption.** We issue each partner a signed JWT out of band (it is configured once in Acme Support). The token carries
+the partner's entitlements, so every replica verifies it statelessly: no session store and no database lookup per request.
+
+```
+header:  {"alg": "HS256", "typ": "JWT", "kid": "2026-11"}
+payload: {"iss": "vyking-integration", "aud": "vyking-partner-api", "sub": "acme-support",
+          "brands": [1, 2], "scope": "transactions:read", "iat": …, "nbf": …, "exp": …, "jti": "…"}
+```
+
+- **Verification.** Signature, `kid`, algorithm (pinned to HS256, so `alg: none` and RS/HS confusion are rejected),
+  issuer, audience, `exp` (required), `nbf`, `iat`, 30s clock-skew leeway, non-empty `sub` and `brands`. A valid token
+  without the `transactions:read` scope is rejected with 403.
+- **Library.** `golang-jwt/jwt/v5` (no transitive dependencies) instead of hand-written JWS parsing; this is
+  security-sensitive code where a vetted implementation beats saving one dependency.
+- **Key rotation.** Several keys can be active (`auth.keys`, selected by `kid`): add the new key, re-issue tokens, remove
+  the old key. Secrets come from env/secret store and must be ≥ 32 bytes (RFC 7518).
+- **Errors** follow RFC 6750 (`WWW-Authenticate` challenges) with stable codes: `unauthorized` (no/foreign scheme),
+  `token_malformed`, `token_expired`, `token_invalid` (signature, issuer, audience, `nbf`, unknown `kid`, no brands) and
+  `insufficient_scope`. Reasons are logged; tokens never are.
+- **Brand scoping.** The `brands` claim is the authorization boundary. Customers of other brands are reported as
+  `404 customer_not_found`, not 403, so a partner cannot probe which emails exist elsewhere.
+- **Test tokens.** `make tokens` prints valid, expired, not-yet-valid, forged, unknown-kid, wrong-audience/issuer,
+  no-brands, no-scope, `alg: none` and malformed tokens signed with the local config; a test guarantees each one produces
+  the outcome its name promises.
+
+**Trade-offs and weaknesses.**
+- A JWT cannot be revoked before it expires. Mitigations: short lifetimes plus rotation, or a `jti` deny-list (shared
+  cache) if Acme needs long-lived tokens.
+- HS256 is symmetric: whoever can verify can also mint. That is acceptable while we are both issuer and verifier, but
+  not if tokens are issued by another system.
+
+**Alternatives we would discuss with Acme Support and Security.**
+1. *Opaque API keys*: a random key per partner, stored hashed (SHA-256) with its brand mapping. Simplest for a static
+   header and instantly revocable; needs a lookup per request (cacheable).
+2. *OAuth 2.0 client credentials*: an identity provider issues short-lived RS256/EdDSA tokens and we verify against its
+   JWKS. Best fit for several partners, with rotation and revocation handled by the IdP. Our verifier would only change
+   its key source.
+3. *mTLS* per partner, possibly combined with one of the above.
+
+**Questions.** How can Acme Support send credentials (static header only, or OAuth)? One token per brand or one token
+covering several brands? Acceptable lifetime and rotation process? Should inbound requests be rate-limited per partner?
+
 ### Error model
 
 - One package (`internal/apierror`) owns the client-facing error shape:

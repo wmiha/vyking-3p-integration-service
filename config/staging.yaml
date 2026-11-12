@@ -74,3 +74,16 @@ database:
       max_idle_conns: 10
       conn_max_lifetime: 30m
       conn_max_idle_time: 5m
+
+# Partner API authentication: HS256 JWTs we issue to partners (see NOTES.md).
+# `kid` selects the verification key so keys can be rotated: add the new key
+# first, re-issue tokens, then remove the previous one. Empty slots are ignored.
+auth:
+  issuer: vyking-integration
+  audience: vyking-partner-api
+  leeway: 30s # tolerated clock skew
+  keys:
+    - kid: "${AUTH_KEY_ID}"
+      secret: "${AUTH_JWT_SECRET}"
+    - kid: "${AUTH_PREVIOUS_KEY_ID:-}"
+      secret: "${AUTH_PREVIOUS_JWT_SECRET:-}"

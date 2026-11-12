@@ -84,3 +84,7 @@ migrate-info: ## Show Flyway migration status
 .PHONY: seed
 seed: ## Load deterministic sample data into the compose database (replaces existing data)
 	$(GO) run ./scripts/seed -reset
+
+.PHONY: tokens
+tokens: ## Print partner test tokens (valid, expired, forged, ...) as TOKEN_*=... lines
+	@$(GO) run ./scripts/tokengen -matrix

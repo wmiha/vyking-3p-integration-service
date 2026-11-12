@@ -56,6 +56,13 @@ database:
     pool: {max_open_conns: 10, max_idle_conns: 5, conn_max_lifetime: 30m, conn_max_idle_time: 5m}
   replica:
     enabled: ${DB_REPLICA_ENABLED:-false}
+auth:
+  issuer: vyking-integration
+  audience: vyking-partner-api
+  leeway: 30s
+  keys:
+    - {kid: "${AUTH_KEY_ID:-k1}", secret: "${AUTH_JWT_SECRET:-test-secret-0123456789-0123456789}"}
+    - {kid: "${AUTH_PREVIOUS_KEY_ID:-}", secret: "${AUTH_PREVIOUS_JWT_SECRET:-}"}
 `
 
 func TestParse(t *testing.T) {
@@ -218,6 +225,7 @@ func TestShippedConfigs(t *testing.T) {
 				VarDir: filepath.Join("..", "..", "config"),
 				// Secrets every non-local environment requires.
 				"DB_HOST": "mysql", "DB_NAME": "vyking", "DB_USER": "app", "DB_PASSWORD": "secret",
+				"AUTH_KEY_ID": "2026-11", "AUTH_JWT_SECRET": "prod-like-secret-0123456789-0123456789",
 			}))
 			require.NoError(t, err)
 			assert.Equal(t, env, cfg.App.Env)
@@ -308,4 +316,62 @@ func TestDatabaseConfig(t *testing.T) {
 			assert.ErrorContains(t, err, want)
 		}
 	})
+}
+
+func TestAuthConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      map[string]string
+		yaml     string // replaces the default auth section when set
+		wantKeys []string
+		wantErr  []string
+	}{
+		{name: "empty rotation slot is ignored", wantKeys: []string{"k1"}},
+		{
+			name:     "rotation with previous key",
+			env:      map[string]string{"AUTH_PREVIOUS_KEY_ID": "k0", "AUTH_PREVIOUS_JWT_SECRET": "old-secret-0123456789-0123456789-01"},
+			wantKeys: []string{"k1", "k0"},
+		},
+		{
+			name:    "short secret",
+			env:     map[string]string{"AUTH_JWT_SECRET": "too-short"},
+			wantErr: []string{"auth.keys[0].secret must be at least 32 bytes"},
+		},
+		{
+			name:    "secret without kid",
+			env:     map[string]string{"AUTH_PREVIOUS_JWT_SECRET": "old-secret-0123456789-0123456789-01"},
+			wantErr: []string{"auth.keys[1].kid is required"},
+		},
+		{
+			name:    "duplicated kid",
+			env:     map[string]string{"AUTH_PREVIOUS_KEY_ID": "k1", "AUTH_PREVIOUS_JWT_SECRET": "old-secret-0123456789-0123456789-01"},
+			wantErr: []string{`auth.keys[1].kid "k1" is duplicated`},
+		},
+		{
+			name:    "no keys and unbounded leeway",
+			yaml:    "auth: {issuer: i, audience: a, leeway: 1h}\n",
+			wantErr: []string{"auth.keys must contain at least one key", "auth.leeway must be between 0 and 5m0s"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := validYAML
+			if tt.yaml != "" {
+				raw = raw[:strings.Index(raw, "auth:")] + tt.yaml
+			}
+			cfg, err := Parse([]byte(raw), mapLookup(tt.env))
+			if len(tt.wantErr) > 0 {
+				for _, want := range tt.wantErr {
+					assert.ErrorContains(t, err, want)
+				}
+				return
+			}
+			require.NoError(t, err)
+			var ids []string
+			for _, k := range cfg.Auth.ActiveKeys() {
+				ids = append(ids, k.ID)
+			}
+			assert.Equal(t, tt.wantKeys, ids)
+		})
+	}
 }

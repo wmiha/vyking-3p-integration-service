@@ -44,6 +44,40 @@ type Config struct {
 	Server   Server   `yaml:"server"`
 	Pprof    Pprof    `yaml:"pprof"`
 	Database Database `yaml:"database"`
+	Auth     Auth     `yaml:"auth"`
+}
+
+// Auth configures partner bearer token verification (HS256 JWTs, see
+// internal/auth). Several keys may be active at once to rotate them without
+// downtime; the first active key is the current signing key.
+type Auth struct {
+	Issuer   string        `yaml:"issuer"`
+	Audience string        `yaml:"audience"`
+	Leeway   time.Duration `yaml:"leeway"`
+	Keys     []AuthKey     `yaml:"keys"`
+}
+
+type AuthKey struct {
+	ID     string `yaml:"kid"`
+	Secret string `yaml:"secret"`
+}
+
+// minAuthSecretLen follows RFC 7518: HS256 keys must be at least 256 bits.
+const minAuthSecretLen = 32
+
+// maxAuthLeeway bounds tolerated clock skew; larger values would extend the
+// lifetime of expired tokens.
+const maxAuthLeeway = 5 * time.Minute
+
+// ActiveKeys returns the configured keys, skipping empty rotation slots.
+func (a Auth) ActiveKeys() []AuthKey {
+	var keys []AuthKey
+	for _, k := range a.Keys {
+		if k.ID != "" || k.Secret != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 // Database configures the MySQL connection pools. Writes and all sync reads
@@ -246,7 +280,36 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Server.validate()...)
 	errs = append(errs, c.Pprof.validate()...)
 	errs = append(errs, c.Database.validate()...)
+	errs = append(errs, c.Auth.validate()...)
 	return errors.Join(errs...)
+}
+
+func (a *Auth) validate() []error {
+	var errs []error
+	if a.Issuer == "" || a.Audience == "" {
+		errs = append(errs, errors.New("auth.issuer and auth.audience are required"))
+	}
+	if a.Leeway < 0 || a.Leeway > maxAuthLeeway {
+		errs = append(errs, fmt.Errorf("auth.leeway must be between 0 and %s", maxAuthLeeway))
+	}
+	keys := a.ActiveKeys()
+	if len(keys) == 0 {
+		errs = append(errs, errors.New("auth.keys must contain at least one key"))
+	}
+	seen := make(map[string]bool, len(keys))
+	for i, k := range keys {
+		if k.ID == "" {
+			errs = append(errs, fmt.Errorf("auth.keys[%d].kid is required", i))
+		}
+		if len(k.Secret) < minAuthSecretLen {
+			errs = append(errs, fmt.Errorf("auth.keys[%d].secret must be at least %d bytes", i, minAuthSecretLen))
+		}
+		if seen[k.ID] {
+			errs = append(errs, fmt.Errorf("auth.keys[%d].kid %q is duplicated", i, k.ID))
+		}
+		seen[k.ID] = true
+	}
+	return errs
 }
 
 func (d *Database) validate() []error {
