@@ -29,6 +29,7 @@ make clean   # stop and delete the data volume for a fresh start
 | `app`    | 8080 (public), 9090 (internal) | distroless image, ~20 MB |
 | `mysql`  | 3306 | MySQL 8.4 LTS, data in volume `vyking-3pi_mysql-data` |
 | `flyway` | –    | one-shot: applies `db/migrations`, then creates the least-privilege `app` user |
+| `acmemock` | 8081 | stand-in for Acme Support: the documented contract, one account per API key, 60/min + burst 10 with `Retry-After`, optional latency and 5xx injection (`ACME_MOCK_*`); state at `/_debug/contacts`, counters at `/_debug/stats` |
 
 To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
 

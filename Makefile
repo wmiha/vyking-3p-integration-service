@@ -66,11 +66,11 @@ docker-build: ## Build the service image (distroless)
 	docker build --build-arg VERSION=$(VERSION) -t $(APP):$(VERSION) -t $(APP):local .
 	@docker image ls $(APP):local --format 'image size: {{.Size}}'
 
-up: ## Build and start MySQL, migrations and the service; waits until healthy
-	VERSION=$(VERSION) $(COMPOSE) up -d --build --wait app
+up: ## Build and start MySQL, migrations, the Acme mock and the service; waits until healthy
+	VERSION=$(VERSION) $(COMPOSE) up -d --build --wait app acmemock
 
-deps-up: ## Start only MySQL and run migrations (for `make run` on the host)
-	$(COMPOSE) up -d --wait mysql
+deps-up: ## Start MySQL (+ migrations) and the Acme mock for `make run` on the host
+	$(COMPOSE) up -d --build --wait mysql acmemock
 	$(COMPOSE) run --rm flyway migrate
 
 down: ## Stop the stack, keep the data volume

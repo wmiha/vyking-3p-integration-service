@@ -52,6 +52,26 @@ services:
         condition: service_healthy
     mem_limit: 384m
 
+  # Stand-in for Acme Support (contract, per-key accounts, 60/min + burst 10
+  # rate limit with Retry-After). Inspect it at localhost:8081/_debug/contacts.
+  acmemock:
+    build:
+      context: .
+      target: acmemock
+    image: vyking-acmemock:local
+    command:
+      - -addr=:8081
+      - -rate=${ACME_MOCK_RATE:-60}
+      - -burst=${ACME_MOCK_BURST:-10}
+      - -latency-min=${ACME_MOCK_LATENCY_MIN:-20ms}
+      - -latency-max=${ACME_MOCK_LATENCY_MAX:-200ms}
+      - -fail-rate=${ACME_MOCK_FAIL_RATE:-0}
+    environment:
+      ACME_MOCK_KEYS: ${ACME_API_KEY_BRAND_1:-acme-key-brand-1-dev-only},${ACME_API_KEY_BRAND_2:-acme-key-brand-2-dev-only}
+    ports:
+      - "${ACME_MOCK_PORT:-8081}:8081"
+    mem_limit: 64m
+
   app:
     build:
       context: .
