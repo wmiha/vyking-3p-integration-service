@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# Force LF for Unix scripts and config files
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
