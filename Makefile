@@ -79,3 +79,8 @@ migrate: ## Apply Flyway migrations to the compose database
 
 migrate-info: ## Show Flyway migration status
 	$(COMPOSE) run --rm flyway info
+
+##@ Test data
+.PHONY: seed
+seed: ## Load deterministic sample data into the compose database (replaces existing data)
+	$(GO) run ./scripts/seed -reset

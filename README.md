@@ -32,6 +32,28 @@ make clean   # stop and delete the data volume for a fresh start
 
 To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
 
+## Sample data
+
+`make seed` loads deterministic sample data into the compose database (it connects as MySQL root because it writes
+tables the service may not, and refuses non-local hosts). Options: `go run ./scripts/seed -h`.
+
+Besides ~200 random customers it creates well-known fixtures covering the edge cases of the task:
+
+| Customer | Brand | Email | Purpose |
+|----------|-------|-------|---------|
+| 1001 | 1 | `jane.doe@example.com` | EUR, every transaction status |
+| 1002 | 2 | `jane.doe@example.com` | same email in another brand (ambiguous for multi-brand partners) |
+| 1003 | 1 | `taro@example.jp` | JPY (0 decimals); has a stale `partner_contacts` id |
+| 1004 | 1 | `ali@example.bh` | BHD (3 decimals) |
+| 1005 | 2 | `sam@example.com` | USD, whose minor units are NULL in the reference data |
+| 1006 | 1 | – | no email: cannot be looked up |
+| 1007 | 1 | `inactive@example.com` | inactive customer |
+| 1008 | 1 | `minimal@example.com` | only mandatory columns |
+| 1009 | 1 | `heavy@example.com` | 250 transactions, for pagination |
+| 1010 | 3 | `poker@example.com` | brand without Acme Support credentials |
+
+Every fixture has outstanding `sync_queue` entries, some customers several (coalescing) and some an already processed one.
+
 ## Database
 
 - `db/migrations` contains the task's schema and reference data as Flyway migrations. They exist for **local development and
