@@ -26,6 +26,18 @@ Configuration lives in per-environment YAML files under [`config/`](config):
 Values in the YAML may reference environment variables: `${VAR}` (required) or `${VAR:-default}`. Secrets are only ever
 provided through environment variables. Unknown keys and invalid values fail fast at startup.
 
+## Operational endpoints (internal port `:9090`)
+
+| Endpoint           | Purpose                                                                 |
+|--------------------|-------------------------------------------------------------------------|
+| `GET /health`      | Liveness: the process is serving HTTP                                   |
+| `GET /ready`       | Readiness: dependencies reachable, not shutting down                    |
+| `/debug/pprof/*`   | Go profiler behind Basic auth (`PPROF_ENABLED`, `PPROF_USERNAME`, `PPROF_PASSWORD`) |
+
+```sh
+go tool pprof -top 'http://pprof:pprof-dev-only@localhost:9090/debug/pprof/heap'   # local defaults
+```
+
 ## Development
 
 ```sh

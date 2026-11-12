@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/handler"
@@ -26,6 +27,9 @@ type App struct {
 
 	public   *http.Server // nil when the public API is disabled
 	internal *http.Server
+	// cancelInternal ends the request contexts of the internal server so
+	// long-running requests (CPU profiles, traces) cannot hold up shutdown.
+	cancelInternal context.CancelFunc
 }
 
 // New wires the application. It does not open listeners; Run does.
@@ -39,13 +43,29 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	a.internal = newHTTPServer(cfg.Server.Internal, logger, handler.NewInternalRouter(handler.InternalDeps{
 		Logger:    logger,
 		Readiness: a.health,
+		Profiler:  profiler(cfg.Pprof),
 	}))
+	internalCtx, cancelInternal := context.WithCancel(context.Background())
+	a.internal.BaseContext = func(net.Listener) context.Context { return internalCtx }
+	a.cancelInternal = cancelInternal
+
 	if cfg.Server.Public.Enabled {
 		a.public = newHTTPServer(cfg.Server.Public, logger, handler.NewPublicRouter(handler.PublicDeps{
 			Logger: logger,
 		}))
 	}
 	return a, nil
+}
+
+// profiler enables the optional block/mutex profiles and returns the
+// credentials guarding /debug/pprof, or nil when profiling is disabled.
+func profiler(c config.Pprof) *handler.Credentials {
+	if !c.Enabled {
+		return nil
+	}
+	runtime.SetBlockProfileRate(c.BlockProfileRate)
+	runtime.SetMutexProfileFraction(c.MutexProfileFraction)
+	return &handler.Credentials{Username: c.Username, Password: c.Password}
 }
 
 func newHTTPServer(c config.HTTPServer, logger *slog.Logger, h http.Handler) *http.Server {
@@ -130,13 +150,18 @@ func (a *App) shutdown() error {
 	if a.public != nil {
 		if err := a.public.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("public server shutdown: %w", err))
+		} else {
+			a.logger.Info("public server stopped")
 		}
-		a.logger.Info("public server stopped")
 	}
+	// Requests on the internal server are operational (probes, metrics,
+	// profiles): cut them short instead of waiting for them.
+	a.cancelInternal()
 	if err := a.internal.Shutdown(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("internal server shutdown: %w", err))
+	} else {
+		a.logger.Info("internal server stopped")
 	}
-	a.logger.Info("internal server stopped")
 
 	err := errors.Join(errs...)
 	a.logger.Info("shutdown complete", "duration_ms", time.Since(start).Milliseconds(), "clean", err == nil)

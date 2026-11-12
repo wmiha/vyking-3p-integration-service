@@ -202,3 +202,41 @@ func TestShippedConfigs(t *testing.T) {
 		})
 	}
 }
+
+func TestPprofValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		pprof   string
+		wantErr []string
+	}{
+		{name: "disabled needs no credentials", pprof: "pprof: {enabled: false}"},
+		{name: "enabled with credentials", pprof: `pprof: {enabled: true, username: ops, password: "long-enough-secret"}`},
+		{
+			name:    "enabled without credentials",
+			pprof:   "pprof: {enabled: true}",
+			wantErr: []string{"pprof.username is required", "pprof.password must be at least 12 characters"},
+		},
+		{
+			name:    "short password",
+			pprof:   `pprof: {enabled: true, username: ops, password: "short"}`,
+			wantErr: []string{"pprof.password must be at least 12 characters"},
+		},
+		{
+			name:    "negative rates",
+			pprof:   "pprof: {enabled: false, block_profile_rate: -1}",
+			wantErr: []string{"must be >= 0"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(validYAML+tt.pprof+"\n"), mapLookup(nil))
+			if len(tt.wantErr) == 0 {
+				require.NoError(t, err)
+				return
+			}
+			for _, want := range tt.wantErr {
+				assert.ErrorContains(t, err, want)
+			}
+		})
+	}
+}

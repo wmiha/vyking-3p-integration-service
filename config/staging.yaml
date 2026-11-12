@@ -26,3 +26,12 @@ server:
     read_timeout: 10s
     write_timeout: 15s
     idle_timeout: 60s
+
+# Runtime profiler on the internal server, behind HTTP Basic auth. Enabling it
+# requires PPROF_USERNAME and PPROF_PASSWORD (min. 12 characters) from a secret.
+pprof:
+  enabled: ${PPROF_ENABLED:-false}
+  username: "${PPROF_USERNAME:-}"
+  password: "${PPROF_PASSWORD:-}"
+  block_profile_rate: 0     # see runtime.SetBlockProfileRate; 0 disables
+  mutex_profile_fraction: 0 # see runtime.SetMutexProfileFraction; 0 disables

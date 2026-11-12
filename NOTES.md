@@ -38,5 +38,12 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
   traffic, then drains the public server, then the internal server, all within `shutdown_timeout`. A second signal forces an
   immediate exit (logged). `terminationGracePeriodSeconds` must exceed `drain_delay + shutdown_timeout`.
 - Access logs record the matched route, never the query string, because it carries customer emails.
+- **Profiling.** `net/http/pprof` is mounted on the internal server only, behind HTTP Basic auth (credentials from
+  env/secret, compared in constant time, min. 12 characters). It is enabled by default only in `local`. Authentication runs
+  *before* routing, so unauthenticated callers cannot discover routes through 404/405/redirect answers. Long CPU profiles and
+  traces extend their own write deadline, and are cut short when shutdown starts so they can never hold a pod past its grace
+  period. Basic auth over plain HTTP is acceptable only because the port is cluster-internal; in production we would rather
+  `kubectl port-forward` or put mTLS in front of it. Errors produced by the pprof handlers themselves (unknown profile,
+  concurrent CPU profile) remain plain text.
 - Known limitation: requests rejected by `net/http` itself before routing (malformed request line, path-cleaning
   redirects) get the standard library's plain-text responses rather than the JSON error envelope.

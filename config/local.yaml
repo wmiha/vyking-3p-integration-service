@@ -27,3 +27,11 @@ server:
     read_timeout: 10s
     write_timeout: 15s
     idle_timeout: 60s
+
+# Runtime profiler on the internal server, behind HTTP Basic auth.
+pprof:
+  enabled: ${PPROF_ENABLED:-true}
+  username: "${PPROF_USERNAME:-pprof}"
+  password: "${PPROF_PASSWORD:-pprof-dev-only}"
+  block_profile_rate: 0     # see runtime.SetBlockProfileRate; 0 disables
+  mutex_profile_fraction: 0 # see runtime.SetMutexProfileFraction; 0 disables

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -141,4 +142,67 @@ func TestRunFailsWhenPortIsTaken(t *testing.T) {
 	ln2, err := net.Listen("tcp", cfg.Server.Internal.Addr)
 	require.NoError(t, err)
 	ln2.Close()
+}
+
+// TestProfileOutlivesWriteTimeout proves that long CPU profiles work even
+// though they exceed the internal server's write timeout: pprof extends its
+// own deadline through http.ResponseController, which must reach the
+// connection through our middleware's response writer wrapper.
+func TestProfileOutlivesWriteTimeout(t *testing.T) {
+	cfg := testConfig(t, false, 0)
+	cfg.Server.Internal.WriteTimeout = time.Second
+	cfg.Pprof = config.Pprof{Enabled: true, Username: "ops", Password: "pprof-secret-1"}
+	cancel, done := start(t, cfg)
+	defer func() { cancel(); require.NoError(t, <-done) }()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+cfg.Server.Internal.Addr+"/debug/pprof/profile?seconds=2", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("ops", "pprof-secret-1")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotEmpty(t, body, "expected a CPU profile")
+}
+
+// TestLongProfileDoesNotBlockShutdown ensures an in-flight 30s CPU profile is
+// cut short at shutdown instead of holding the process until the shutdown
+// timeout expires.
+func TestLongProfileDoesNotBlockShutdown(t *testing.T) {
+	cfg := testConfig(t, false, 0)
+	cfg.Pprof = config.Pprof{Enabled: true, Username: "ops", Password: "pprof-secret-1"}
+	cancel, done := start(t, cfg)
+
+	type result struct {
+		status int
+		body   []byte
+		err    error
+	}
+	profile := make(chan result, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodGet, "http://"+cfg.Server.Internal.Addr+"/debug/pprof/profile?seconds=30", nil)
+		req.SetBasicAuth("ops", "pprof-secret-1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			profile <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		profile <- result{status: resp.StatusCode, body: body, err: err}
+	}()
+	time.Sleep(500 * time.Millisecond) // let the profile start
+
+	start := time.Now()
+	cancel()
+	require.NoError(t, <-done, "shutdown must stay clean")
+	assert.Less(t, time.Since(start), 3*time.Second, "profile must not hold the shutdown")
+
+	res := <-profile
+	require.NoError(t, res.err)
+	assert.Equal(t, http.StatusOK, res.status)
+	assert.NotEmpty(t, res.body, "the partial profile is still delivered")
 }

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strings"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/apierror"
@@ -24,6 +23,14 @@ type ReadinessChecker interface {
 type InternalDeps struct {
 	Logger    *slog.Logger
 	Readiness ReadinessChecker
+	// Profiler enables /debug/pprof/* behind Basic auth; nil disables it.
+	Profiler *Credentials
+}
+
+// Credentials for HTTP Basic authentication.
+type Credentials struct {
+	Username string
+	Password string
 }
 
 // NewInternalRouter serves operational endpoints: probes, metrics, profiling
@@ -32,6 +39,10 @@ func NewInternalRouter(d InternalDeps) http.Handler {
 	rt := newRouter()
 	rt.handle(http.MethodGet, "/health", http.HandlerFunc(liveness))
 	rt.handle(http.MethodGet, "/ready", readiness(d.Readiness))
+	if d.Profiler != nil {
+		registerPprof(rt)
+		rt.guard("/debug/pprof", BasicAuth("pprof", d.Profiler.Username, d.Profiler.Password))
+	}
 	return rt.build(d.Logger, "/health", "/ready")
 }
 
@@ -49,43 +60,75 @@ func NewPublicRouter(d PublicDeps) http.Handler {
 // router wraps http.ServeMux so that unknown paths and unsupported methods
 // are answered with the standard JSON error envelope instead of plain text.
 type router struct {
-	mux     *http.ServeMux
-	methods map[string][]string // path -> allowed methods
+	mux    *http.ServeMux
+	guards []Middleware
 }
 
 func newRouter() *router {
-	return &router{mux: http.NewServeMux(), methods: make(map[string][]string)}
+	return &router{mux: http.NewServeMux()}
 }
 
-func (rt *router) handle(method, path string, h http.Handler) {
-	rt.mux.Handle(method+" "+path, h)
+func (rt *router) handle(method, pattern string, h http.Handler) {
+	rt.mux.Handle(method+" "+pattern, h)
+}
 
-	if _, seen := rt.methods[path]; !seen {
-		rt.mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Allow", strings.Join(rt.methods[path], ", "))
-			apierror.Write(w, r, apierror.New(http.StatusMethodNotAllowed, apierror.CodeMethodNotAllowed,
-				"method "+r.Method+" is not allowed on "+path))
+// guard applies mw to every request whose path starts with prefix *before*
+// routing, so unauthenticated callers cannot discover routes under it through
+// 404/405 answers or redirects.
+func (rt *router) guard(prefix string, mw Middleware) {
+	rt.guards = append(rt.guards, func(next http.Handler) http.Handler {
+		guarded := mw(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, prefix) {
+				guarded.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
 		})
-	}
-	rt.methods[path] = append(rt.methods[path], method)
-	if method == http.MethodGet {
-		rt.methods[path] = append(rt.methods[path], http.MethodHead)
-	}
-	slices.Sort(rt.methods[path])
+	})
 }
 
-// build registers the JSON 404 fallback and wraps the mux with the standard
-// middleware chain. quietPaths are access-logged at debug level.
+// ServeHTTP dispatches matched requests to the mux. For unmatched ones the
+// mux still decides between 404 and 405 (it knows which methods are
+// registered for the path and computes the Allow header), but its plain-text
+// answer is replaced with the JSON error envelope.
+func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if _, pattern := rt.mux.Handler(r); pattern != "" {
+		rt.mux.ServeHTTP(w, r)
+		return
+	}
+
+	probe := &statusProbe{header: make(http.Header)}
+	rt.mux.ServeHTTP(probe, r)
+	if probe.status == http.StatusMethodNotAllowed {
+		w.Header().Set("Allow", probe.header.Get("Allow"))
+		apierror.Write(w, r, apierror.New(http.StatusMethodNotAllowed, apierror.CodeMethodNotAllowed,
+			"method "+r.Method+" is not allowed on "+r.URL.Path))
+		return
+	}
+	apierror.Write(w, r, apierror.New(http.StatusNotFound, apierror.CodeNotFound, "resource not found"))
+}
+
+// build wraps the router with the standard middleware chain. quietPaths are
+// access-logged at debug level.
 func (rt *router) build(logger *slog.Logger, quietPaths ...string) http.Handler {
-	rt.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		apierror.Write(w, r, apierror.New(http.StatusNotFound, apierror.CodeNotFound, "resource not found"))
-	})
-	return Chain(rt.mux,
+	mws := []Middleware{
 		RequestID(),
 		AccessLog(logger, quietPaths...),
 		Recover(logger),
-	)
+	}
+	return Chain(rt, append(mws, rt.guards...)...)
 }
+
+// statusProbe captures the status and headers the mux would have written.
+type statusProbe struct {
+	header http.Header
+	status int
+}
+
+func (p *statusProbe) Header() http.Header         { return p.header }
+func (p *statusProbe) Write(b []byte) (int, error) { return len(b), nil }
+func (p *statusProbe) WriteHeader(code int)        { p.status = code }
 
 // writeJSON renders a successful JSON response.
 func writeJSON(w http.ResponseWriter, status int, v any) {

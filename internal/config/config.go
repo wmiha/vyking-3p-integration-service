@@ -42,7 +42,22 @@ type Config struct {
 	App    App    `yaml:"app"`
 	Log    Log    `yaml:"log"`
 	Server Server `yaml:"server"`
+	Pprof  Pprof  `yaml:"pprof"`
 }
+
+// Pprof controls the runtime profiler on the internal server.
+type Pprof struct {
+	Enabled  bool   `yaml:"enabled"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	// BlockProfileRate is passed to runtime.SetBlockProfileRate (0 disables).
+	BlockProfileRate int `yaml:"block_profile_rate"`
+	// MutexProfileFraction is passed to runtime.SetMutexProfileFraction (0 disables).
+	MutexProfileFraction int `yaml:"mutex_profile_fraction"`
+}
+
+// minPprofPasswordLen rejects trivially guessable profiler passwords.
+const minPprofPasswordLen = 12
 
 type App struct {
 	Name string `yaml:"name"`
@@ -192,7 +207,24 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("log.format %q must be text or json", c.Log.Format))
 	}
 	errs = append(errs, c.Server.validate()...)
+	errs = append(errs, c.Pprof.validate()...)
 	return errors.Join(errs...)
+}
+
+func (p *Pprof) validate() []error {
+	var errs []error
+	if p.Enabled {
+		if p.Username == "" {
+			errs = append(errs, errors.New("pprof.username is required when pprof is enabled"))
+		}
+		if len(p.Password) < minPprofPasswordLen {
+			errs = append(errs, fmt.Errorf("pprof.password must be at least %d characters when pprof is enabled", minPprofPasswordLen))
+		}
+	}
+	if p.BlockProfileRate < 0 || p.MutexProfileFraction < 0 {
+		errs = append(errs, errors.New("pprof.block_profile_rate and pprof.mutex_profile_fraction must be >= 0"))
+	}
+	return errs
 }
 
 func (s *Server) validate() []error {
