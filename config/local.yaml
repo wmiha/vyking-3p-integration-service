@@ -35,3 +35,41 @@ pprof:
   password: "${PPROF_PASSWORD:-pprof-dev-only}"
   block_profile_rate: 0     # see runtime.SetBlockProfileRate; 0 disables
   mutex_profile_fraction: 0 # see runtime.SetMutexProfileFraction; 0 disables
+
+# MySQL. Writes and every sync read go to the primary; partner API reads go to
+# the replica when enabled (falls back to the primary otherwise).
+database:
+  startup_timeout: 30s # keep pinging the database this long before giving up
+  query_timeout: 5s    # upper bound for a single repository call
+  tx_max_retries: 3    # re-run transactions aborted by deadlock / lock wait timeout
+  primary:
+    host: "${DB_HOST:-127.0.0.1}"
+    port: ${DB_PORT:-3306}
+    name: "${DB_NAME:-vyking}"
+    user: "${DB_USER:-app}"
+    password: "${DB_PASSWORD:-app-dev-only}"
+    timezone: UTC # DATETIME columns carry no zone; assumed UTC
+    connect_timeout: 5s
+    read_timeout: 30s
+    write_timeout: 30s
+    pool:
+      max_open_conns: 10
+      max_idle_conns: 5
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 5m
+  replica:
+    enabled: ${DB_REPLICA_ENABLED:-false}
+    host: "${DB_REPLICA_HOST:-127.0.0.1}"
+    port: ${DB_REPLICA_PORT:-3306}
+    name: "${DB_NAME:-vyking}"
+    user: "${DB_REPLICA_USER:-app}"
+    password: "${DB_REPLICA_PASSWORD:-app-dev-only}"
+    timezone: UTC
+    connect_timeout: 5s
+    read_timeout: 30s
+    write_timeout: 30s
+    pool:
+      max_open_conns: 10
+      max_idle_conns: 5
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 5m

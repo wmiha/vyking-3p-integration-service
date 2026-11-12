@@ -35,3 +35,42 @@ pprof:
   password: "${PPROF_PASSWORD:-}"
   block_profile_rate: 0     # see runtime.SetBlockProfileRate; 0 disables
   mutex_profile_fraction: 0 # see runtime.SetMutexProfileFraction; 0 disables
+
+# MySQL. Writes and every sync read go to the primary; partner API reads go to
+# the replica when enabled (falls back to the primary otherwise). Pool sizes
+# are per pod: total connections = replicas x max_open_conns.
+database:
+  startup_timeout: 30s # keep pinging the database this long before giving up
+  query_timeout: 5s    # upper bound for a single repository call
+  tx_max_retries: 3    # re-run transactions aborted by deadlock / lock wait timeout
+  primary:
+    host: "${DB_HOST}"
+    port: ${DB_PORT:-3306}
+    name: "${DB_NAME}"
+    user: "${DB_USER}"
+    password: "${DB_PASSWORD}"
+    timezone: UTC # DATETIME columns carry no zone; assumed UTC
+    connect_timeout: 5s
+    read_timeout: 30s
+    write_timeout: 30s
+    pool:
+      max_open_conns: 20
+      max_idle_conns: 10
+      conn_max_lifetime: 30m # below proxy / server idle timeouts
+      conn_max_idle_time: 5m
+  replica:
+    enabled: ${DB_REPLICA_ENABLED:-false}
+    host: "${DB_REPLICA_HOST:-}"
+    port: ${DB_REPLICA_PORT:-3306}
+    name: "${DB_NAME}"
+    user: "${DB_REPLICA_USER:-}"
+    password: "${DB_REPLICA_PASSWORD:-}"
+    timezone: UTC
+    connect_timeout: 5s
+    read_timeout: 30s
+    write_timeout: 30s
+    pool:
+      max_open_conns: 20
+      max_idle_conns: 10
+      conn_max_lifetime: 30m
+      conn_max_idle_time: 5m

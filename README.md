@@ -11,7 +11,35 @@ Design decisions, assumptions and open questions are documented in [NOTES.md](NO
 ## Requirements
 
 - Go 1.27+
+- Docker with Compose v2
 - GNU make and bash (on Windows run the targets from WSL: `wsl make <target>`)
+
+## Quick start (Docker)
+
+```sh
+make up      # build the image, start MySQL, apply Flyway migrations, start the service (waits until healthy)
+curl localhost:9090/ready
+make logs    # follow service logs
+make down    # stop, keep data (named volume survives restarts)
+make clean   # stop and delete the data volume for a fresh start
+```
+
+| Service  | Port | Notes |
+|----------|------|-------|
+| `app`    | 8080 (public), 9090 (internal) | distroless image, ~20 MB |
+| `mysql`  | 3306 | MySQL 8.4 LTS, data in volume `vyking-3pi_mysql-data` |
+| `flyway` | –    | one-shot: applies `db/migrations`, then creates the least-privilege `app` user |
+
+To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
+
+## Database
+
+- `db/migrations` contains the task's schema and reference data as Flyway migrations. They exist for **local development and
+  tests only**; the production schema is owned by another team and must never be migrated by this service.
+- `db/callbacks/afterMigrate__app_user.sql` creates the `app` user the service connects with. It can read everything but
+  write only `sync_queue` and `partner_contacts`, so the "read-only except two tables" rule is enforced by the database.
+- The service waits up to `database.startup_timeout` for the database before opening its listeners, then exits non-zero
+  so the orchestrator restarts it. `/ready` reports each connection pool separately.
 
 ## Configuration
 
@@ -25,6 +53,16 @@ Configuration lives in per-environment YAML files under [`config/`](config):
 
 Values in the YAML may reference environment variables: `${VAR}` (required) or `${VAR:-default}`. Secrets are only ever
 provided through environment variables. Unknown keys and invalid values fail fast at startup.
+
+Main environment variables (see the YAML files for every tunable):
+
+| Variable | Purpose |
+|----------|---------|
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | primary database (writes and sync reads) |
+| `DB_REPLICA_ENABLED`, `DB_REPLICA_HOST`, `DB_REPLICA_PORT`, `DB_REPLICA_USER`, `DB_REPLICA_PASSWORD` | optional read replica for partner API reads |
+| `LOG_LEVEL`, `LOG_FORMAT` | `debug`/`info`/`warn`/`error`, `text`/`json` |
+| `PPROF_ENABLED`, `PPROF_USERNAME`, `PPROF_PASSWORD` | profiler on the internal port |
+| `PUBLIC_ENABLED` | `false` runs the instance as a sync-only worker |
 
 ## Operational endpoints (internal port `:9090`)
 

@@ -39,10 +39,47 @@ const (
 type LookupFunc func(key string) (string, bool)
 
 type Config struct {
-	App    App    `yaml:"app"`
-	Log    Log    `yaml:"log"`
-	Server Server `yaml:"server"`
-	Pprof  Pprof  `yaml:"pprof"`
+	App      App      `yaml:"app"`
+	Log      Log      `yaml:"log"`
+	Server   Server   `yaml:"server"`
+	Pprof    Pprof    `yaml:"pprof"`
+	Database Database `yaml:"database"`
+}
+
+// Database configures the MySQL connection pools. Writes and all sync reads
+// use the primary; partner API reads use the replica when it is enabled.
+type Database struct {
+	// StartupTimeout is how long start-up waits for the database to answer.
+	StartupTimeout time.Duration `yaml:"startup_timeout"`
+	// QueryTimeout bounds a single repository call.
+	QueryTimeout time.Duration `yaml:"query_timeout"`
+	// TxMaxRetries re-runs transactions aborted by deadlocks or lock waits.
+	TxMaxRetries int    `yaml:"tx_max_retries"`
+	Primary      DBConn `yaml:"primary"`
+	Replica      DBConn `yaml:"replica"`
+}
+
+type DBConn struct {
+	// Enabled is only honoured for the replica; the primary is mandatory.
+	Enabled  bool   `yaml:"enabled"`
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Name     string `yaml:"name"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	// Timezone of the zone-less DATETIME columns.
+	Timezone       string        `yaml:"timezone"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
+	ReadTimeout    time.Duration `yaml:"read_timeout"`
+	WriteTimeout   time.Duration `yaml:"write_timeout"`
+	Pool           DBPool        `yaml:"pool"`
+}
+
+type DBPool struct {
+	MaxOpenConns    int           `yaml:"max_open_conns"`
+	MaxIdleConns    int           `yaml:"max_idle_conns"`
+	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
+	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time"`
 }
 
 // Pprof controls the runtime profiler on the internal server.
@@ -208,7 +245,59 @@ func (c *Config) Validate() error {
 	}
 	errs = append(errs, c.Server.validate()...)
 	errs = append(errs, c.Pprof.validate()...)
+	errs = append(errs, c.Database.validate()...)
 	return errors.Join(errs...)
+}
+
+func (d *Database) validate() []error {
+	var errs []error
+	if d.StartupTimeout <= 0 {
+		errs = append(errs, errors.New("database.startup_timeout must be positive"))
+	}
+	if d.QueryTimeout <= 0 {
+		errs = append(errs, errors.New("database.query_timeout must be positive"))
+	}
+	if d.TxMaxRetries < 0 {
+		errs = append(errs, errors.New("database.tx_max_retries must be >= 0"))
+	}
+	errs = append(errs, d.Primary.validate("database.primary")...)
+	if d.Replica.Enabled {
+		errs = append(errs, d.Replica.validate("database.replica")...)
+	}
+	return errs
+}
+
+func (c *DBConn) validate(prefix string) []error {
+	var errs []error
+	for name, v := range map[string]string{"host": c.Host, "name": c.Name, "user": c.User, "timezone": c.Timezone} {
+		if v == "" {
+			errs = append(errs, fmt.Errorf("%s.%s is required", prefix, name))
+		}
+	}
+	if c.Port < 1 || c.Port > 65535 {
+		errs = append(errs, fmt.Errorf("%s.port %d is out of range", prefix, c.Port))
+	}
+	for name, d := range map[string]time.Duration{
+		"connect_timeout": c.ConnectTimeout,
+		"read_timeout":    c.ReadTimeout,
+		"write_timeout":   c.WriteTimeout,
+	} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s.%s must be positive", prefix, name))
+		}
+	}
+	p := c.Pool
+	if p.MaxOpenConns < 1 {
+		errs = append(errs, fmt.Errorf("%s.pool.max_open_conns must be at least 1", prefix))
+	}
+	if p.MaxIdleConns < 0 || p.MaxIdleConns > p.MaxOpenConns {
+		errs = append(errs, fmt.Errorf("%s.pool.max_idle_conns must be between 0 and max_open_conns", prefix))
+	}
+	if p.ConnMaxLifetime < 0 || p.ConnMaxIdleTime < 0 {
+		errs = append(errs, fmt.Errorf("%s.pool lifetimes must be >= 0", prefix))
+	}
+	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
+	return errs
 }
 
 func (p *Pprof) validate() []error {

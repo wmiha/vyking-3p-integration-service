@@ -11,3 +11,7 @@ coverage.out
 # Local environment overrides (never commit real credentials)
 .env
 .env.*
+
+# Binaries built on the host (Windows go build output)
+*.exe
+/server

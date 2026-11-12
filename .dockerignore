@@ -7,3 +7,5 @@ coverage.out
 *.md
 .env
 .env.*
+*.exe
+/server

@@ -15,6 +15,27 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
 - **Strict decoding.** Unknown keys are rejected and all validation errors are reported together, so a typo in a tuning
   parameter fails the deployment instead of silently running with a zero value.
 
+### Database access
+
+- **Flyway is for local development and tests only.** The schema is "fixed and owned elsewhere"; running migrations against
+  production would also write `flyway_schema_history`, a table we are not allowed to write. The migrations reproduce the given
+  schema verbatim (only wrapped comments were joined) so local and test runs behave like production.
+- **Least privilege enforced by MySQL.** The `app` user (created by a Flyway callback locally) has `SELECT` on the schema,
+  `INSERT, UPDATE` on `partner_contacts` and `UPDATE` on `sync_queue`, nothing else, not even `DELETE`. The task's write
+  restriction is therefore guaranteed by the database, not just by code review. Production should use the same grants.
+- **Primary/replica split.** Two pools with independent sizing: the primary takes writes and *all* sync reads; the replica
+  (optional, falls back to the primary) takes partner API reads. The sync must never read from a replica: a lagging customer
+  snapshot could be pushed to Acme and the queue entry marked processed, silently losing the newer change.
+- **Pool tuning lives in config** (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime`, `conn_max_idle_time`), per pool
+  and per environment. Total connections = pods × `max_open_conns`; this must stay below the server's `max_connections`.
+  `conn_max_lifetime` (30m) is kept below typical proxy/load-balancer idle timeouts.
+- **Timezones.** `DATETIME` columns carry no zone. We assume UTC (configurable per pool) and always write `UTC_TIMESTAMP()`.
+- **One transaction helper.** Every multi-statement write goes through `database.WithTx`: commit on success, rollback on
+  error or panic, and bounded, jittered retries of the *whole* unit of work on deadlock (1213) or lock wait timeout (1205).
+  There is no partially applied state.
+- **Start-up.** The service waits up to `database.startup_timeout` for its pools before opening listeners, then exits
+  non-zero, which makes a misconfiguration visible as a crash loop instead of a pod that is silently never ready.
+
 ### Error model
 
 - One package (`internal/apierror`) owns the client-facing error shape:

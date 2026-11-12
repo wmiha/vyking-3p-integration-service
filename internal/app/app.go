@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,16 +15,29 @@ import (
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/handler"
 	"github.com/wmiha/vyking-3p-integration-service/internal/config"
+	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
 )
 
-const maxHeaderBytes = 16 << 10
+const (
+	maxHeaderBytes = 16 << 10
+	// dbRetryInterval paces connection attempts while waiting at start-up.
+	dbRetryInterval = time.Second
+)
+
+// openDB opens a connection pool; replaced in tests.
+var openDB = database.Open
 
 // App is a fully wired service instance.
 type App struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	health *health.Checker
+
+	// primary serves writes and every sync read; replica serves partner API
+	// reads and is the primary itself when no replica is configured.
+	primary *sql.DB
+	replica *sql.DB
 
 	public   *http.Server // nil when the public API is disabled
 	internal *http.Server
@@ -32,12 +46,19 @@ type App struct {
 	cancelInternal context.CancelFunc
 }
 
-// New wires the application. It does not open listeners; Run does.
+// New wires the application. It opens connection pools lazily and does not
+// open listeners; Run does both.
 func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	a := &App{
 		cfg:    cfg,
 		logger: logger,
 		health: health.NewChecker(cfg.Server.ReadinessTimeout),
+	}
+	if err := database.SetDriverLogger(logger); err != nil {
+		return nil, fmt.Errorf("mysql driver logger: %w", err)
+	}
+	if err := a.openDatabases(); err != nil {
+		return nil, err
 	}
 
 	a.internal = newHTTPServer(cfg.Server.Internal, logger, handler.NewInternalRouter(handler.InternalDeps{
@@ -55,6 +76,44 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		}))
 	}
 	return a, nil
+}
+
+func (a *App) openDatabases() error {
+	primary, err := openDB(dbConfig(a.cfg.Database.Primary))
+	if err != nil {
+		return fmt.Errorf("open primary database: %w", err)
+	}
+	a.primary, a.replica = primary, primary
+	a.health.Register("database_primary", health.PingFunc(primary.PingContext))
+
+	if a.cfg.Database.Replica.Enabled {
+		replica, err := openDB(dbConfig(a.cfg.Database.Replica))
+		if err != nil {
+			_ = primary.Close()
+			return fmt.Errorf("open replica database: %w", err)
+		}
+		a.replica = replica
+		a.health.Register("database_replica", health.PingFunc(replica.PingContext))
+	}
+	return nil
+}
+
+func dbConfig(c config.DBConn) database.Config {
+	return database.Config{
+		Host:            c.Host,
+		Port:            c.Port,
+		Name:            c.Name,
+		User:            c.User,
+		Password:        c.Password,
+		Timezone:        c.Timezone,
+		ConnectTimeout:  c.ConnectTimeout,
+		ReadTimeout:     c.ReadTimeout,
+		WriteTimeout:    c.WriteTimeout,
+		MaxOpenConns:    c.Pool.MaxOpenConns,
+		MaxIdleConns:    c.Pool.MaxIdleConns,
+		ConnMaxLifetime: c.Pool.ConnMaxLifetime,
+		ConnMaxIdleTime: c.Pool.ConnMaxIdleTime,
+	}
 }
 
 // profiler enables the optional block/mutex profiles and returns the
@@ -81,9 +140,14 @@ func newHTTPServer(c config.HTTPServer, logger *slog.Logger, h http.Handler) *ht
 	}
 }
 
-// Run serves traffic until ctx is cancelled or a server fails, then shuts
-// down gracefully. It returns nil after a clean shutdown.
+// Run waits for the database, serves traffic until ctx is cancelled or a
+// server fails, then shuts down gracefully. It returns nil after a clean
+// shutdown.
 func (a *App) Run(ctx context.Context) error {
+	if err := a.waitForDatabases(ctx); err != nil {
+		return errors.Join(err, a.closeDatabases())
+	}
+
 	servers := map[string]*http.Server{"internal": a.internal}
 	if a.public != nil {
 		servers["public"] = a.public
@@ -98,7 +162,7 @@ func (a *App) Run(ctx context.Context) error {
 			for _, l := range listeners {
 				_ = l.Close()
 			}
-			return fmt.Errorf("listen %s server on %s: %w", name, srv.Addr, err)
+			return errors.Join(fmt.Errorf("listen %s server on %s: %w", name, srv.Addr, err), a.closeDatabases())
 		}
 		listeners[name] = ln
 	}
@@ -123,13 +187,36 @@ func (a *App) Run(ctx context.Context) error {
 	return errors.Join(runErr, a.shutdown())
 }
 
+// waitForDatabases blocks until every pool answers, so an instance never
+// reports itself started without its database. It gives up after
+// database.startup_timeout and lets the orchestrator restart it.
+func (a *App) waitForDatabases(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, a.cfg.Database.StartupTimeout)
+	defer cancel()
+
+	pools := map[string]*sql.DB{"primary": a.primary}
+	if a.replica != a.primary {
+		pools["replica"] = a.replica
+	}
+	for name, db := range pools {
+		start := time.Now()
+		a.logger.Info("waiting for database", "pool", name, "timeout", a.cfg.Database.StartupTimeout.String())
+		if err := database.WaitReady(ctx, db, dbRetryInterval); err != nil {
+			return fmt.Errorf("%s database: %w", name, err)
+		}
+		a.logger.Info("database ready", "pool", name, "waited_ms", time.Since(start).Milliseconds())
+	}
+	return nil
+}
+
 // shutdown stops the instance in dependency order:
 //  1. readiness turns unavailable and we wait drain_delay so the load
 //     balancer stops sending new requests;
 //  2. the public server stops accepting connections and drains in-flight
 //     requests;
-//  3. the internal server (probes, metrics) closes last so the instance stays
-//     observable until the very end.
+//  3. the internal server (probes, metrics) closes so the instance stays
+//     observable until the very end;
+//  4. connection pools close once nothing can use them anymore.
 //
 // Everything shares one deadline: server.shutdown_timeout.
 func (a *App) shutdown() error {
@@ -162,8 +249,29 @@ func (a *App) shutdown() error {
 	} else {
 		a.logger.Info("internal server stopped")
 	}
+	if err := a.closeDatabases(); err != nil {
+		errs = append(errs, err)
+	}
 
 	err := errors.Join(errs...)
 	a.logger.Info("shutdown complete", "duration_ms", time.Since(start).Milliseconds(), "clean", err == nil)
 	return err
+}
+
+// closeDatabases closes the pools; sql.DB.Close waits for queries that
+// already started to finish.
+func (a *App) closeDatabases() error {
+	var errs []error
+	if a.replica != a.primary {
+		if err := a.replica.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close replica database: %w", err))
+		}
+	}
+	if err := a.primary.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close primary database: %w", err))
+	}
+	if len(errs) == 0 {
+		a.logger.Info("database pools closed")
+	}
+	return errors.Join(errs...)
 }

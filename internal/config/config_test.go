@@ -36,6 +36,26 @@ server:
     read_timeout: 2s
     write_timeout: 3s
     idle_timeout: 4s
+` + databaseYAML
+
+const databaseYAML = `
+database:
+  startup_timeout: 30s
+  query_timeout: 5s
+  tx_max_retries: 3
+  primary:
+    host: "${DB_HOST:-127.0.0.1}"
+    port: ${DB_PORT:-3306}
+    name: vyking
+    user: app
+    password: "${DB_PASSWORD:-dummy}"
+    timezone: UTC
+    connect_timeout: 1s
+    read_timeout: 2s
+    write_timeout: 3s
+    pool: {max_open_conns: 10, max_idle_conns: 5, conn_max_lifetime: 30m, conn_max_idle_time: 5m}
+  replica:
+    enabled: ${DB_REPLICA_ENABLED:-false}
 `
 
 func TestParse(t *testing.T) {
@@ -130,7 +150,7 @@ server:
   readiness_timeout: 1s
   public: {enabled: false}
   internal: {addr: ":9090", read_header_timeout: 1s, read_timeout: 1s, write_timeout: 1s, idle_timeout: 1s}
-`,
+` + databaseYAML,
 			check: func(t *testing.T, c *Config) { assert.False(t, c.Server.Public.Enabled) },
 		},
 	}
@@ -196,6 +216,8 @@ func TestShippedConfigs(t *testing.T) {
 			cfg, err := Load(mapLookup(map[string]string{
 				VarEnv: env,
 				VarDir: filepath.Join("..", "..", "config"),
+				// Secrets every non-local environment requires.
+				"DB_HOST": "mysql", "DB_NAME": "vyking", "DB_USER": "app", "DB_PASSWORD": "secret",
 			}))
 			require.NoError(t, err)
 			assert.Equal(t, env, cfg.App.Env)
@@ -239,4 +261,51 @@ func TestPprofValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDatabaseConfig(t *testing.T) {
+	t.Run("defaults and coercion", func(t *testing.T) {
+		cfg, err := Parse([]byte(validYAML), mapLookup(map[string]string{"DB_PORT": "3307"}))
+		require.NoError(t, err)
+		db := cfg.Database
+		assert.Equal(t, 3307, db.Primary.Port)
+		assert.Equal(t, "127.0.0.1", db.Primary.Host)
+		assert.Equal(t, 10, db.Primary.Pool.MaxOpenConns)
+		assert.Equal(t, 30*time.Minute, db.Primary.Pool.ConnMaxLifetime)
+		assert.False(t, db.Replica.Enabled, "an unconfigured replica is not validated")
+	})
+
+	t.Run("password with yaml syntax", func(t *testing.T) {
+		cfg, err := Parse([]byte(validYAML), mapLookup(map[string]string{"DB_PASSWORD": `p@ss: "w#rd"`}))
+		require.NoError(t, err)
+		assert.Equal(t, `p@ss: "w#rd"`, cfg.Database.Primary.Password)
+	})
+
+	t.Run("enabled replica is validated", func(t *testing.T) {
+		_, err := Parse([]byte(validYAML), mapLookup(map[string]string{"DB_REPLICA_ENABLED": "true"}))
+		require.Error(t, err)
+		for _, want := range []string{
+			"database.replica.host is required",
+			"database.replica.port 0 is out of range",
+			"database.replica.pool.max_open_conns must be at least 1",
+		} {
+			assert.ErrorContains(t, err, want)
+		}
+	})
+
+	t.Run("invalid primary", func(t *testing.T) {
+		bad := strings.NewReplacer(
+			"max_open_conns: 10, max_idle_conns: 5", "max_open_conns: 2, max_idle_conns: 5",
+			"query_timeout: 5s", "query_timeout: 0s",
+		).Replace(validYAML)
+		_, err := Parse([]byte(bad), mapLookup(map[string]string{"DB_PORT": "70000"}))
+		require.Error(t, err)
+		for _, want := range []string{
+			"database.query_timeout must be positive",
+			"database.primary.port 70000 is out of range",
+			"database.primary.pool.max_idle_conns must be between 0 and max_open_conns",
+		} {
+			assert.ErrorContains(t, err, want)
+		}
+	})
 }

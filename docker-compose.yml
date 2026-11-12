@@ -1,0 +1,88 @@
+# Local stack: MySQL + Flyway migrations + the service.
+#
+#   make up      build and start everything (waits until healthy)
+#   make down    stop, keep data
+#   make clean   stop and delete the data volume (fresh start)
+#
+# All credentials below are dummy values for local development only.
+name: vyking-3pi
+
+services:
+  mysql:
+    image: mysql:8.4.13
+    command:
+      # Tuned for small developer machines; production sizing is a DBA concern.
+      - --innodb-buffer-pool-size=128M
+      - --performance-schema=OFF
+      - --skip-name-resolve
+      - --max-connections=100
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-dev-only}
+      MYSQL_DATABASE: ${DB_NAME:-vyking}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql # survives restarts; `make clean` removes it
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+      start_interval: 1s # poll fast while starting, then every interval
+    mem_limit: 640m
+
+  flyway:
+    image: flyway/flyway:13.12.1-alpine
+    command: migrate
+    environment:
+      FLYWAY_URL: jdbc:mysql://mysql:3306/${DB_NAME:-vyking}?allowPublicKeyRetrieval=true&useSSL=false
+      FLYWAY_USER: root
+      FLYWAY_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-dev-only}
+      FLYWAY_LOCATIONS: filesystem:/flyway/migrations,filesystem:/flyway/callbacks
+      FLYWAY_CONNECT_RETRIES: "30"
+      FLYWAY_PLACEHOLDERS_APP_USER: ${DB_USER:-app}
+      FLYWAY_PLACEHOLDERS_APP_PASSWORD: ${DB_PASSWORD:-app-dev-only}
+      JAVA_ARGS: -Xmx128m
+    volumes:
+      - ./db/migrations:/flyway/migrations:ro
+      - ./db/callbacks:/flyway/callbacks:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    mem_limit: 384m
+
+  app:
+    build:
+      context: .
+      target: server
+      args:
+        VERSION: ${VERSION:-dev}
+    image: vyking-3p-integration-service:local
+    environment:
+      APP_ENV: local
+      LOG_FORMAT: json
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-vyking}
+      DB_USER: ${DB_USER:-app}
+      DB_PASSWORD: ${DB_PASSWORD:-app-dev-only}
+    ports:
+      - "${PUBLIC_PORT:-8080}:8080"
+      - "${INTERNAL_PORT:-9090}:9090"
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/app/server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # Must exceed drain_delay + shutdown_timeout from the config.
+    stop_grace_period: 60s
+    mem_limit: 128m
+
+volumes:
+  mysql-data:

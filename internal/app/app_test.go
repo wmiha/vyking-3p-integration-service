@@ -2,11 +2,15 @@ package app
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +18,40 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/config"
+	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 )
+
+// fakeDB stands in for MySQL: connections open instantly and pings succeed
+// until down is set, which simulates an outage.
+type fakeDB struct{ down atomic.Bool }
+
+func (f *fakeDB) Connect(context.Context) (driver.Conn, error) {
+	if f.down.Load() {
+		return nil, errors.New("connection refused")
+	}
+	return fakeConn{f}, nil
+}
+func (f *fakeDB) Driver() driver.Driver { return nil }
+
+type fakeConn struct{ db *fakeDB }
+
+func (c fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
+func (c fakeConn) Close() error                        { return nil }
+func (c fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+func (c fakeConn) Ping(context.Context) error {
+	if c.db.down.Load() {
+		return errors.New("connection refused")
+	}
+	return nil
+}
+
+// useFakeDB routes every pool the app opens to db.
+func useFakeDB(t *testing.T, db *fakeDB) {
+	t.Helper()
+	orig := openDB
+	openDB = func(database.Config) (*sql.DB, error) { return sql.OpenDB(db), nil }
+	t.Cleanup(func() { openDB = orig })
+}
 
 func freeAddr(t *testing.T) string {
 	t.Helper()
@@ -44,11 +81,23 @@ func testConfig(t *testing.T, publicEnabled bool, drain time.Duration) *config.C
 			Public:           srv(freeAddr(t), publicEnabled),
 			Internal:         srv(freeAddr(t), true),
 		},
+		Database: config.Database{
+			StartupTimeout: 2 * time.Second,
+			QueryTimeout:   time.Second,
+			Primary:        config.DBConn{Host: "primary", Port: 3306, Timezone: "UTC", Pool: config.DBPool{MaxOpenConns: 2}},
+			Replica:        config.DBConn{Host: "replica", Port: 3306, Timezone: "UTC", Pool: config.DBPool{MaxOpenConns: 2}},
+		},
 	}
 }
 
 func start(t *testing.T, cfg *config.Config) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
+	return startWith(t, cfg, &fakeDB{})
+}
+
+func startWith(t *testing.T, cfg *config.Config, db *fakeDB) (cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	useFakeDB(t, db)
 	a, err := New(cfg, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
@@ -133,6 +182,7 @@ func TestRunFailsWhenPortIsTaken(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
+	useFakeDB(t, &fakeDB{})
 	a, err := New(cfg, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 	err = a.Run(context.Background())
@@ -205,4 +255,56 @@ func TestLongProfileDoesNotBlockShutdown(t *testing.T) {
 	require.NoError(t, res.err)
 	assert.Equal(t, http.StatusOK, res.status)
 	assert.NotEmpty(t, res.body, "the partial profile is still delivered")
+}
+
+func TestReadinessReflectsDatabase(t *testing.T) {
+	cfg := testConfig(t, false, 0)
+	db := &fakeDB{}
+	cancel, done := startWith(t, cfg, db)
+	defer func() { cancel(); require.NoError(t, <-done) }()
+
+	ready := "http://" + cfg.Server.Internal.Addr + "/ready"
+	status, body := get(t, ready)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, map[string]any{"database_primary": "ok"}, body["checks"])
+
+	db.down.Store(true)
+	status, body = get(t, ready)
+	assert.Equal(t, http.StatusServiceUnavailable, status)
+	assert.Equal(t, "unavailable", body["status"])
+	assert.Equal(t, map[string]any{"database_primary": "connection refused"}, body["checks"])
+
+	status, _ = get(t, "http://"+cfg.Server.Internal.Addr+"/health")
+	assert.Equal(t, http.StatusOK, status, "liveness must not depend on the database")
+
+	db.down.Store(false)
+	status, _ = get(t, ready)
+	assert.Equal(t, http.StatusOK, status, "readiness recovers with the database")
+}
+
+func TestReplicaIsCheckedWhenEnabled(t *testing.T) {
+	cfg := testConfig(t, false, 0)
+	cfg.Database.Replica.Enabled = true
+	cancel, done := start(t, cfg)
+	defer func() { cancel(); require.NoError(t, <-done) }()
+
+	_, body := get(t, "http://"+cfg.Server.Internal.Addr+"/ready")
+	assert.Equal(t, map[string]any{"database_primary": "ok", "database_replica": "ok"}, body["checks"])
+}
+
+func TestStartupFailsWithoutDatabase(t *testing.T) {
+	cfg := testConfig(t, true, 0)
+	cfg.Database.StartupTimeout = 300 * time.Millisecond
+	db := &fakeDB{}
+	db.down.Store(true)
+	useFakeDB(t, db)
+
+	a, err := New(cfg, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	err = a.Run(context.Background())
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "primary database: database not reachable")
+
+	_, err = http.Get("http://" + cfg.Server.Internal.Addr + "/health")
+	assert.Error(t, err, "no listener may be opened before the database is reachable")
 }
