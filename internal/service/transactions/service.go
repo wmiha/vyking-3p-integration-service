@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/domain"
 )
@@ -33,16 +34,23 @@ type Result struct {
 type Service struct {
 	customers    CustomerFinder
 	transactions TransactionLister
+	cache        ResultCache // nil disables caching
 }
 
-func NewService(customers CustomerFinder, transactions TransactionLister) *Service {
-	return &Service{customers: customers, transactions: transactions}
+// NewService returns the use case; cache may be nil.
+func NewService(customers CustomerFinder, transactions TransactionLister, cache ResultCache) *Service {
+	return &Service{customers: customers, transactions: transactions, cache: cache}
 }
 
 // Find resolves the customer by email within the partner's brands and returns
 // one page of their transactions.
+//
+// Successful results are cached briefly: support agents tend to repeat the
+// same lookup while handling a ticket. The cache key contains the effective
+// brand scope, so a result is never served to a caller with different
+// entitlements. Errors are not cached.
 func (s *Service) Find(ctx context.Context, p domain.Principal, q Query) (Result, error) {
-	brands := p.Brands
+	brands := slices.Clone(p.Brands)
 	if q.Brand != 0 {
 		if !p.CanAccessBrand(q.Brand) {
 			return Result{}, domain.ErrBrandForbidden
@@ -50,6 +58,28 @@ func (s *Service) Find(ctx context.Context, p domain.Principal, q Query) (Result
 		brands = []domain.BrandID{q.Brand}
 	}
 
+	key := cacheKey(brands, q)
+	if s.cache != nil {
+		if res, ok := s.cache.Get(ctx, key); ok {
+			return res, nil
+		}
+	}
+	res, err := s.find(ctx, brands, q)
+	if err == nil && s.cache != nil {
+		s.cache.Set(ctx, key, res)
+	}
+	return res, err
+}
+
+// cacheKey identifies a query within an authorization scope.
+func cacheKey(brands []domain.BrandID, q Query) string {
+	slices.Sort(brands)
+	statuses := slices.Clone(q.Statuses)
+	slices.Sort(statuses)
+	return fmt.Sprintf("tx|%v|%s|%v|%d|%s", brands, strings.ToLower(q.Email), statuses, q.Limit, q.Cursor)
+}
+
+func (s *Service) find(ctx context.Context, brands []domain.BrandID, q Query) (Result, error) {
 	customer, err := s.resolveCustomer(ctx, q.Email, brands)
 	if err != nil {
 		return Result{}, err

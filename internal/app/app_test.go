@@ -310,3 +310,13 @@ func TestStartupFailsWithoutDatabase(t *testing.T) {
 	_, err = http.Get("http://" + cfg.Server.Internal.Addr + "/health")
 	assert.Error(t, err, "no listener may be opened before the database is reachable")
 }
+
+func TestCacheIsAReadinessDependency(t *testing.T) {
+	cfg := testConfig(t, true, 0)
+	cfg.Cache = config.Cache{Enabled: true, TTL: time.Second, MaxEntries: 10, SweepInterval: time.Second}
+	cancel, done := start(t, cfg)
+	defer func() { cancel(); require.NoError(t, <-done, "the cache sweeper stops at shutdown") }()
+
+	_, body := get(t, "http://"+cfg.Server.Internal.Addr+"/ready")
+	assert.Equal(t, map[string]any{"database_primary": "ok", "cache": "ok"}, body["checks"])
+}

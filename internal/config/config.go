@@ -46,6 +46,18 @@ type Config struct {
 	Database   Database   `yaml:"database"`
 	Auth       Auth       `yaml:"auth"`
 	PartnerAPI PartnerAPI `yaml:"partner_api"`
+	Cache      Cache      `yaml:"cache"`
+}
+
+// Cache configures the short-lived partner lookup cache.
+type Cache struct {
+	Enabled bool `yaml:"enabled"`
+	// TTL is how stale a cached transaction page may be.
+	TTL time.Duration `yaml:"ttl"`
+	// MaxEntries bounds memory use; each entry is one page.
+	MaxEntries int `yaml:"max_entries"`
+	// SweepInterval is how often expired entries are freed.
+	SweepInterval time.Duration `yaml:"sweep_interval"`
 }
 
 // PartnerAPI tunes the public transactions endpoint.
@@ -293,6 +305,9 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Pprof.validate()...)
 	errs = append(errs, c.Database.validate()...)
 	errs = append(errs, c.Auth.validate()...)
+	if c.Cache.Enabled && (c.Cache.TTL <= 0 || c.Cache.MaxEntries < 1 || c.Cache.SweepInterval <= 0) {
+		errs = append(errs, errors.New("cache.ttl, cache.max_entries and cache.sweep_interval must be positive when the cache is enabled"))
+	}
 	if c.Server.Public.Enabled && (c.PartnerAPI.DefaultLimit < 1 || c.PartnerAPI.DefaultLimit > c.PartnerAPI.MaxLimit || c.PartnerAPI.MaxLimit > maxPageSize) {
 		errs = append(errs, fmt.Errorf("partner_api limits must satisfy 1 <= default_limit <= max_limit <= %d", maxPageSize))
 	}

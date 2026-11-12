@@ -159,6 +159,7 @@ Main environment variables (see the YAML files for every tunable):
 | `LOG_LEVEL`, `LOG_FORMAT` | `debug`/`info`/`warn`/`error`, `text`/`json` |
 | `PPROF_ENABLED`, `PPROF_USERNAME`, `PPROF_PASSWORD` | profiler on the internal port |
 | `PUBLIC_ENABLED` | `false` runs the instance as a sync-only worker |
+| `CACHE_ENABLED` | in-process cache of partner lookups (15s TTL) |
 
 ## Operational endpoints (internal port `:9090`)
 

@@ -16,10 +16,12 @@ type fakeCustomers struct {
 	byBrand   map[domain.BrandID]domain.Customer
 	err       error
 	gotBrands []domain.BrandID
+	calls     int
 }
 
 func (f *fakeCustomers) FindByEmail(_ context.Context, _ string, brands []domain.BrandID) ([]domain.Customer, error) {
 	f.gotBrands = brands
+	f.calls++
 	var out []domain.Customer
 	for _, b := range brands {
 		if c, ok := f.byBrand[b]; ok {
@@ -89,7 +91,7 @@ func TestFindResolvesCustomer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			customers := &fakeCustomers{byBrand: tt.customers, err: tt.lookupErr}
-			svc := NewService(customers, &fakeTransactions{n: 3})
+			svc := NewService(customers, &fakeTransactions{n: 3}, nil)
 
 			res, err := svc.Find(context.Background(), tt.principal, Query{Email: "jane@example.com", Limit: 10, Brand: tt.brand})
 			assert.Equal(t, tt.wantBrands, customers.gotBrands)
@@ -110,7 +112,7 @@ func TestFindResolvesCustomer(t *testing.T) {
 
 func TestFindPaginates(t *testing.T) {
 	txs := &fakeTransactions{n: 25}
-	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, txs)
+	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, txs, nil)
 
 	var (
 		seen   []uint64
@@ -140,7 +142,7 @@ func TestFindPaginates(t *testing.T) {
 
 func TestFindStatusFilterAndCursorBinding(t *testing.T) {
 	txs := &fakeTransactions{n: 5}
-	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, txs)
+	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, txs, nil)
 	ctx := context.Background()
 
 	res, err := svc.Find(ctx, reader, Query{Email: "j", Limit: 2, Statuses: []domain.Status{domain.StatusFailed, domain.StatusCancelled}})
@@ -174,7 +176,7 @@ func TestFindStatusFilterAndCursorBinding(t *testing.T) {
 }
 
 func TestFindCursorIsBoundToCustomer(t *testing.T) {
-	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1, 2: jane2}}, &fakeTransactions{n: 5})
+	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1, 2: jane2}}, &fakeTransactions{n: 5}, nil)
 	ctx := context.Background()
 
 	res, err := svc.Find(ctx, reader, Query{Email: "j", Limit: 2, Brand: 1})
@@ -186,7 +188,61 @@ func TestFindCursorIsBoundToCustomer(t *testing.T) {
 
 func TestFindPropagatesListErrors(t *testing.T) {
 	listErr := errors.New("timeout")
-	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, &fakeTransactions{err: listErr})
+	svc := NewService(&fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}, &fakeTransactions{err: listErr}, nil)
 	_, err := svc.Find(context.Background(), reader, Query{Email: "j", Limit: 2})
 	assert.ErrorIs(t, err, listErr)
+}
+
+type mapCache map[string]Result
+
+func (m mapCache) Get(_ context.Context, key string) (Result, bool) { r, ok := m[key]; return r, ok }
+func (m mapCache) Set(_ context.Context, key string, r Result)      { m[key] = r }
+
+func TestFindCaches(t *testing.T) {
+	ctx := context.Background()
+	query := Query{Email: "Jane@Example.com", Limit: 10, Statuses: []domain.Status{domain.StatusFailed, domain.StatusCancelled}}
+
+	tests := []struct {
+		name       string
+		second     Query
+		principal  domain.Principal
+		wantLookup int // lookups after both calls
+	}{
+		{name: "identical query is served from the cache", second: query, principal: reader, wantLookup: 1},
+		{name: "email case and status order do not matter",
+			second:    Query{Email: "jane@example.com", Limit: 10, Statuses: []domain.Status{domain.StatusCancelled, domain.StatusFailed}},
+			principal: reader, wantLookup: 1},
+		{name: "brand order does not matter", second: query,
+			principal: domain.Principal{Brands: []domain.BrandID{2, 1}}, wantLookup: 1},
+		{name: "another brand scope never shares results", second: query,
+			principal: domain.Principal{Brands: []domain.BrandID{1}}, wantLookup: 2},
+		{name: "explicit brand is another scope", second: Query{Email: query.Email, Limit: 10, Statuses: query.Statuses, Brand: 1},
+			principal: reader, wantLookup: 2},
+		{name: "page size is part of the key", second: Query{Email: query.Email, Limit: 11, Statuses: query.Statuses},
+			principal: reader, wantLookup: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			customers := &fakeCustomers{byBrand: map[domain.BrandID]domain.Customer{1: jane1}}
+			svc := NewService(customers, &fakeTransactions{n: 3}, mapCache{})
+
+			first, err := svc.Find(ctx, reader, query)
+			require.NoError(t, err)
+			second, err := svc.Find(ctx, tt.principal, tt.second)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantLookup, customers.calls)
+			assert.Equal(t, first.Customer, second.Customer)
+		})
+	}
+}
+
+func TestFindDoesNotCacheErrors(t *testing.T) {
+	customers := &fakeCustomers{}
+	svc := NewService(customers, &fakeTransactions{}, mapCache{})
+	for range 2 {
+		_, err := svc.Find(context.Background(), reader, Query{Email: "nobody@example.com", Limit: 10})
+		assert.ErrorIs(t, err, domain.ErrCustomerNotFound)
+	}
+	assert.Equal(t, 2, customers.calls, "a customer created meanwhile is found immediately")
 }

@@ -406,3 +406,15 @@ func TestPartnerAPIConfig(t *testing.T) {
 	_, err := Parse([]byte(raw), mapLookup(map[string]string{"PUBLIC_ENABLED": "false"}))
 	assert.NoError(t, err)
 }
+
+func TestCacheConfig(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML+"cache: {enabled: true, ttl: 15s, max_entries: 100, sweep_interval: 1m}\n"), mapLookup(nil))
+	require.NoError(t, err)
+	assert.Equal(t, Cache{Enabled: true, TTL: 15 * time.Second, MaxEntries: 100, SweepInterval: time.Minute}, cfg.Cache)
+
+	_, err = Parse([]byte(validYAML+"cache: {enabled: true, ttl: 0s, max_entries: 100, sweep_interval: 1m}\n"), mapLookup(nil))
+	assert.ErrorContains(t, err, "cache.ttl, cache.max_entries and cache.sweep_interval must be positive")
+
+	_, err = Parse([]byte(validYAML+"cache: {enabled: false}\n"), mapLookup(nil))
+	assert.NoError(t, err, "a disabled cache needs no settings")
+}

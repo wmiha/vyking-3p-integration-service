@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/cache"
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/handler"
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/repository"
 	"github.com/wmiha/vyking-3p-integration-service/internal/auth"
@@ -41,6 +42,8 @@ type App struct {
 	// reads and is the primary itself when no replica is configured.
 	primary *sql.DB
 	replica *sql.DB
+	// cache holds partner lookups; nil when disabled.
+	cache *cache.Memory[transactions.Result]
 
 	public   *http.Server // nil when the public API is disabled
 	internal *http.Server
@@ -100,10 +103,18 @@ func (a *App) partnerAPI() (http.Handler, error) {
 		return nil, err
 	}
 
+	var results transactions.ResultCache
+	if c := a.cfg.Cache; c.Enabled {
+		a.cache = cache.NewMemory[transactions.Result](c.TTL, c.MaxEntries, c.SweepInterval)
+		a.health.Register("cache", a.cache)
+		results = a.cache
+	}
+
 	timeout := a.cfg.Database.QueryTimeout
 	finder := transactions.NewService(
 		repository.NewCustomers(a.replica, timeout),
 		repository.NewTransactions(a.replica, timeout),
+		results,
 	)
 	return handler.NewPublicRouter(handler.PublicDeps{
 		Logger:       a.logger,
@@ -283,6 +294,9 @@ func (a *App) shutdown() error {
 		errs = append(errs, fmt.Errorf("internal server shutdown: %w", err))
 	} else {
 		a.logger.Info("internal server stopped")
+	}
+	if a.cache != nil {
+		a.cache.Close()
 	}
 	if err := a.closeDatabases(); err != nil {
 		errs = append(errs, err)

@@ -92,3 +92,11 @@ auth:
 partner_api:
   default_limit: 20 # page size when the partner sends no limit ("recent" is not defined by the task)
   max_limit: 100    # largest page a partner may request
+
+# Short-lived, in-process cache for partner lookups: support agents repeat the
+# same lookup while handling a ticket. Per replica; see NOTES.md for Redis.
+cache:
+  enabled: ${CACHE_ENABLED:-true}
+  ttl: 15s           # how stale a transaction page may be
+  max_entries: 10000 # bounds memory (one entry per page)
+  sweep_interval: 1m

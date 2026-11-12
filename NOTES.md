@@ -109,6 +109,23 @@ to carry authorization-relevant data.
 - IDs are strings (64-bit ids exceed JavaScript's safe integer range); amounts are exact decimal literals.
 - Inactive customers are still returned, since support needs their history. Question: confirm.
 
+### Cache for partner lookups
+
+- Support agents tend to repeat the same lookup while handling a ticket, so successful results are cached for a short
+  TTL (15s, configurable; `CACHE_ENABLED=false` turns it off). Errors are never cached, so a customer created a moment
+  ago is found immediately.
+- **The key contains the effective brand scope** (plus email, statuses, page size and cursor), so a result is never
+  served to a caller with different entitlements.
+- **Staleness is the trade-off.** Writes happen in other systems, so the cache cannot be invalidated and the TTL alone
+  bounds staleness; a transaction may show its previous status for up to 15s. A CDC stream (see "Load and scalability")
+  could invalidate keys on change.
+- **Swappable backend.** The use case depends on a two-method `ResultCache` port. The in-process `Memory` cache is bounded
+  (max entries, periodic sweep), costs nothing to operate and is a readiness dependency like any backend would be. It is
+  per replica, so hit rates drop as pods are added and each pod holds its own copy of the PII. A Redis implementation
+  would be one more type in `internal/adapter/cache` (serialize `Result`, `PING` for readiness) with no change to the
+  service or handlers. It would then need encryption in transit, access control and short TTLs, since it stores
+  personal data.
+
 ### Partner authentication (deliberately unspecified by the task)
 
 The task only says Acme Support calls us with `Authorization: Bearer <partner-token>` and that a partner must only access
