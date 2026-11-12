@@ -14,3 +14,15 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
   ones always stay strings.
 - **Strict decoding.** Unknown keys are rejected and all validation errors are reported together, so a typo in a tuning
   parameter fails the deployment instead of silently running with a zero value.
+
+### Error model
+
+- One package (`internal/apierror`) owns the client-facing error shape:
+  `{"error": {"code", "message", "request_id", "details"}}`. Codes are stable, snake_case and only ever added, never renamed,
+  so Acme Support can map them reliably.
+- Services return domain errors; only the HTTP layer translates them to API errors. Anything unexpected becomes
+  `500 internal_error` with a generic message, and the internal cause is logged, never serialized.
+- Dependency outages (database, cache) are reported as `503 service_unavailable` rather than 500 so clients know a retry
+  is appropriate.
+- Every response carries `X-Request-ID` (UUIDv7, time-ordered). A caller-supplied id is reused only if it is a short
+  `[A-Za-z0-9._-]` token, which prevents header/log injection.
