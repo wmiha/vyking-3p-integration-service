@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/handler"
+	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/repository"
+	"github.com/wmiha/vyking-3p-integration-service/internal/auth"
 	"github.com/wmiha/vyking-3p-integration-service/internal/config"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
+	"github.com/wmiha/vyking-3p-integration-service/internal/service/transactions"
 )
 
 const (
@@ -71,11 +74,43 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	a.cancelInternal = cancelInternal
 
 	if cfg.Server.Public.Enabled {
-		a.public = newHTTPServer(cfg.Server.Public, logger, handler.NewPublicRouter(handler.PublicDeps{
-			Logger: logger,
-		}))
+		public, err := a.partnerAPI()
+		if err != nil {
+			return nil, errors.Join(err, a.closeDatabases())
+		}
+		a.public = newHTTPServer(cfg.Server.Public, logger, public)
 	}
 	return a, nil
+}
+
+// partnerAPI wires the public, partner-facing API. Its reads go to the
+// replica pool (the primary when no replica is configured).
+func (a *App) partnerAPI() (http.Handler, error) {
+	keys := make([]auth.Key, 0, len(a.cfg.Auth.Keys))
+	for _, k := range a.cfg.Auth.ActiveKeys() {
+		keys = append(keys, auth.Key{ID: k.ID, Secret: []byte(k.Secret)})
+	}
+	verifier, err := auth.NewVerifier(auth.Config{
+		Issuer:   a.cfg.Auth.Issuer,
+		Audience: a.cfg.Auth.Audience,
+		Leeway:   a.cfg.Auth.Leeway,
+		Keys:     keys,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	timeout := a.cfg.Database.QueryTimeout
+	finder := transactions.NewService(
+		repository.NewCustomers(a.replica, timeout),
+		repository.NewTransactions(a.replica, timeout),
+	)
+	return handler.NewPublicRouter(handler.PublicDeps{
+		Logger:       a.logger,
+		Verifier:     verifier,
+		Transactions: finder,
+		Limits:       handler.PageLimits{Default: a.cfg.PartnerAPI.DefaultLimit, Max: a.cfg.PartnerAPI.MaxLimit},
+	}), nil
 }
 
 func (a *App) openDatabases() error {

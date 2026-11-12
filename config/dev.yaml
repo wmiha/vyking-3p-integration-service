@@ -87,3 +87,8 @@ auth:
       secret: "${AUTH_JWT_SECRET}"
     - kid: "${AUTH_PREVIOUS_KEY_ID:-}"
       secret: "${AUTH_PREVIOUS_JWT_SECRET:-}"
+
+# Public partner API (GET /v1/transactions).
+partner_api:
+  default_limit: 20 # page size when the partner sends no limit ("recent" is not defined by the task)
+  max_limit: 100    # largest page a partner may request

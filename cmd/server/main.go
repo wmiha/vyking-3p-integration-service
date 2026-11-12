@@ -48,6 +48,9 @@ func run(args []string) int {
 
 	logger := logging.New(os.Stdout, cfg.Log.Level, cfg.Log.Format).
 		With("service", cfg.App.Name, "env", cfg.App.Env, "version", version)
+	// Packages that log through slog's default (e.g. apierror) share the same
+	// handler, format and service attributes.
+	slog.SetDefault(logger)
 
 	a, err := app.New(cfg, logger)
 	if err != nil {

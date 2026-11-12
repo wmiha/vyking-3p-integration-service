@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/apierror"
+	"github.com/wmiha/vyking-3p-integration-service/internal/domain"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
 )
 
@@ -48,12 +49,19 @@ func NewInternalRouter(d InternalDeps) http.Handler {
 
 // PublicDeps are the collaborators of the public (partner-facing) router.
 type PublicDeps struct {
-	Logger *slog.Logger
+	Logger       *slog.Logger
+	Verifier     TokenVerifier
+	Transactions TransactionFinder
+	Limits       PageLimits
 }
 
-// NewPublicRouter serves the partner API.
+// NewPublicRouter serves the partner API. Every route requires a bearer
+// token; the request id and access log apply to rejected requests too.
 func NewPublicRouter(d PublicDeps) http.Handler {
 	rt := newRouter()
+	authenticated := Authenticate(d.Verifier, domain.ScopeTransactionsRead, d.Logger)
+	rt.handle(http.MethodGet, "/v1/transactions",
+		authenticated(listTransactions(d.Transactions, d.Limits, d.Logger)))
 	return rt.build(d.Logger)
 }
 

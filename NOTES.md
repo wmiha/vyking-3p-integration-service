@@ -29,12 +29,85 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
 - **Pool tuning lives in config** (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime`, `conn_max_idle_time`), per pool
   and per environment. Total connections = pods × `max_open_conns`; this must stay below the server's `max_connections`.
   `conn_max_lifetime` (30m) is kept below typical proxy/load-balancer idle timeouts.
+- **The replica is a hard dependency when enabled.** Start-up waits for it and `/ready` fails without it, so a replica
+  outage takes partner reads down even though the primary could serve them. We would rather point `DB_REPLICA_HOST` at
+  an endpoint that fails over by itself (RDS reader endpoint, ProxySQL) than build read failover into the service.
+- **Client-side parameter interpolation** (`interpolateParams`) saves a prepare/execute round trip per query. It is safe
+  with the utf8mb4 connection charset.
 - **Timezones.** `DATETIME` columns carry no zone. We assume UTC (configurable per pool) and always write `UTC_TIMESTAMP()`.
 - **One transaction helper.** Every multi-statement write goes through `database.WithTx`: commit on success, rollback on
   error or panic, and bounded, jittered retries of the *whole* unit of work on deadlock (1213) or lock wait timeout (1205).
   There is no partially applied state.
 - **Start-up.** The service waits up to `database.startup_timeout` for its pools before opening listeners, then exits
   non-zero, which makes a misconfiguration visible as a crash loop instead of a pod that is silently never ready.
+
+### Partner API: data gaps and how they are handled
+
+The schema does not contain everything the response must expose. Each gap below is handled explicitly and would be
+confirmed with the business before going live.
+
+| Requirement | What the schema offers | Decision |
+|---|---|---|
+| Acme's 4 statuses | 15 internal statuses | Mapping below, by `STA_iID` (stable) rather than by name. |
+| Settlement timestamp | No such column. `TRX_dBooked` means "accepted for processing", not settled | `settled_at` = `TRX_dChanged` for `settled`/`settled_late` only (the last state change was the settlement), otherwise `null`. For reversed/chargeback the settlement time is lost. |
+| Failure reason | No such column | Derived from the status: `declined_by_provider`, `declined`, `limit_exceeded`, `cancelled_by_customer`, `cancelled_by_operator`, `timed_out`. |
+| Currency of a transaction | Transactions have no currency | The customer's **current** currency. If a customer's currency ever changed, older amounts would be mislabelled. Question: can it change? |
+| Amount in major units | Minor units; `CUR_iMinorUnits` is `NULL` for USD | DB value, else ISO 4217 table in code (USD = 2), else `amount: null` plus a warning. Never guess (a wrong guess is a 100× error). Rendered with integer arithmetic as an exact JSON number. |
+| Amount | `TRX_iAmount` is nullable; sign convention for payouts/adjustments unknown | `null` stays `null`; values are returned as stored. Question: are payouts negative? |
+| Timestamps in RFC 3339 | `DATETIME` without zone | Assumed UTC (configurable per pool), emitted with `Z`. |
+| Customer by email | Unique per brand only | Lookup within the token's brands; several matches → `409 customer_ambiguous` with the brand ids, repeat with `brand_id` (see below). |
+| "Recent" transactions | Undefined | Newest first, page size default 20 / max 100 (config), keyset pagination for more. No date window. Question: is there a retention or time window Acme expects? |
+
+**Status mapping** (`internal/domain/status.go`, unit-tested):
+
+| Acme status | Internal statuses | Note |
+|---|---|---|
+| `pending` | reserved, pending_provider, awaiting_approval, approved, booked | approved/booked: accepted but no money moved yet |
+| `completed` | settled, settled_late, **reversed, chargeback** | money did move; reversals are visible through `status_detail` |
+| `failed` | declined_provider, declined_risk, declined_limit | risk declines are exposed as a generic `declined` so fraud rules are not disclosed to a third party |
+| `cancelled` | cancelled_by_customer, cancelled_by_operator, cancelled_timeout | |
+| `pending` | any unknown status id | logged as a warning; never claims money moved or a final state we cannot verify |
+
+Reversed and chargeback are the most debatable rows. Mapping them to `failed` or `cancelled` would contradict Acme's
+definitions ("will not complete", "stopped before completion"), because the payment *did* complete. `completed` plus
+`status_detail: reversed/chargeback` keeps the vocabulary correct and lets the support agent see what happened.
+Questions: is this mapping acceptable? Should reversals rather be reported as separate events?
+
+**Same email in several brands.** A token may cover several brands, while emails are unique per brand only. We return
+`409 customer_ambiguous` with `details.brand_ids` and let the caller repeat the request with `brand_id`. Alternatives:
+return all matching customers with their transactions (a bigger, less predictable response, and one support ticket
+usually concerns one brand), or always require `brand_id` (more friction for the common single-match case). The chosen
+behaviour is explicit, cheap and never mixes customers in one answer.
+
+**Pagination.** Keyset pagination on `(TRX_dCreated DESC, TRX_iID DESC)`: stable while new transactions arrive, ties on
+the second-precision timestamp broken by id, and every page is an index range scan on the existing
+`(TRX_CUS_iID, TRX_dCreated)` key (InnoDB appends the primary key). Offset pagination would skip or repeat rows and
+cost O(offset). The cursor is opaque and bound to the customer and status filter, so it cannot be replayed against a
+different query.
+
+**Query plan, measured.** The first version joined `transaction_types`/`payment_methods` directly. MySQL hash-joins
+those tiny tables, which discards the index order and turns every page into a sort of the customer's *entire*
+history (`Using temporary; Using filesort`, 200k rows read, ~0.9s per page for a customer with 200k transactions). The
+query now selects the page from `transactions` alone in a derived table (`Backward index scan`, stops after `limit`
+rows) and joins the names onto those rows only: p50 16 ms for the same customer. An integration test reads MySQL's
+handler counters and fails if a page reads more than a small multiple of its size.
+
+**Email matching.** The column collation `utf8mb4_0900_ai_ci` is accent-insensitive as well as case-insensitive, so
+`jané.doe@example.com` would have returned `jane.doe@example.com`'s transactions. The indexed comparison narrows the
+candidates and an exact, case-insensitive comparison in Go decides. Forcing an accent-sensitive collation in SQL would
+have disabled the index.
+
+**Cursor integrity.** Cursors are opaque but not signed. A partner editing one can only move within the same customer
+and filter it is already authorized for, so we did not add an HMAC; it would be a small addition if cursors were ever
+to carry authorization-relevant data.
+
+**Privacy and safety.**
+- Customers outside the token's brands answer `404`, never `403`, so a partner cannot probe which emails exist elsewhere.
+- Emails are masked in logs, and the query string (which carries the email) is never logged. Proxies in front of the
+  service may still log URLs; a `POST /v1/transactions/search` with the email in the body would avoid that, at the cost of
+  a non-idiomatic read endpoint. Question for Acme: can they send the email in a body?
+- IDs are strings (64-bit ids exceed JavaScript's safe integer range); amounts are exact decimal literals.
+- Inactive customers are still returned, since support needs their history. Question: confirm.
 
 ### Partner authentication (deliberately unspecified by the task)
 

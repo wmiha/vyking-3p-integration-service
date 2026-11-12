@@ -20,7 +20,7 @@ help: ## Show available targets
 		/^[a-zA-Z0-9_-]+:.*##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 ##@ Development
-.PHONY: tidy fmt vet lint test cover build run
+.PHONY: tidy fmt vet lint test test-integration cover build run
 tidy: ## Tidy go.mod/go.sum
 	$(GO) mod tidy
 
@@ -35,6 +35,18 @@ lint: vet ## Check formatting and run go vet
 
 test: ## Run unit tests with the race detector
 	$(GO) test -race -count=1 ./...
+
+IT_COMPOSE := docker compose -f docker-compose.test.yml
+# Packages with //go:build integration tests; they share one database, hence -p 1.
+IT_PACKAGES := ./test/integration/... ./internal/adapter/repository/...
+
+test-integration: ## Run integration tests against a throwaway MySQL (always torn down; CI-friendly)
+	@rc=0; \
+	$(IT_COMPOSE) up -d --wait mysql && $(IT_COMPOSE) run --rm flyway migrate || rc=$$?; \
+	if [ $$rc -eq 0 ]; then $(GO) test -tags=integration -count=1 -p 1 -v $(IT_PACKAGES) || rc=$$?; fi; \
+	$(IT_COMPOSE) down -v --remove-orphans; \
+	if [ $$rc -ne 0 ]; then echo "integration tests FAILED (exit $$rc)"; fi; \
+	exit $$rc
 
 cover: ## Run unit tests with coverage report (coverage.out)
 	$(GO) test -count=1 -coverprofile=coverage.out ./...

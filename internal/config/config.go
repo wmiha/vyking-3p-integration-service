@@ -39,13 +39,25 @@ const (
 type LookupFunc func(key string) (string, bool)
 
 type Config struct {
-	App      App      `yaml:"app"`
-	Log      Log      `yaml:"log"`
-	Server   Server   `yaml:"server"`
-	Pprof    Pprof    `yaml:"pprof"`
-	Database Database `yaml:"database"`
-	Auth     Auth     `yaml:"auth"`
+	App        App        `yaml:"app"`
+	Log        Log        `yaml:"log"`
+	Server     Server     `yaml:"server"`
+	Pprof      Pprof      `yaml:"pprof"`
+	Database   Database   `yaml:"database"`
+	Auth       Auth       `yaml:"auth"`
+	PartnerAPI PartnerAPI `yaml:"partner_api"`
 }
+
+// PartnerAPI tunes the public transactions endpoint.
+type PartnerAPI struct {
+	// DefaultLimit is the page size when the partner sends no limit.
+	DefaultLimit int `yaml:"default_limit"`
+	// MaxLimit caps the page size a partner may request.
+	MaxLimit int `yaml:"max_limit"`
+}
+
+// maxPageSize is a hard ceiling protecting the database from huge pages.
+const maxPageSize = 500
 
 // Auth configures partner bearer token verification (HS256 JWTs, see
 // internal/auth). Several keys may be active at once to rotate them without
@@ -281,6 +293,9 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Pprof.validate()...)
 	errs = append(errs, c.Database.validate()...)
 	errs = append(errs, c.Auth.validate()...)
+	if c.Server.Public.Enabled && (c.PartnerAPI.DefaultLimit < 1 || c.PartnerAPI.DefaultLimit > c.PartnerAPI.MaxLimit || c.PartnerAPI.MaxLimit > maxPageSize) {
+		errs = append(errs, fmt.Errorf("partner_api limits must satisfy 1 <= default_limit <= max_limit <= %d", maxPageSize))
+	}
 	return errors.Join(errs...)
 }
 

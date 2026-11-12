@@ -32,6 +32,63 @@ make clean   # stop and delete the data volume for a fresh start
 
 To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
 
+## Partner API
+
+```http
+GET /v1/transactions?email=jane.doe@example.com&status=failed,cancelled&limit=20 HTTP/1.1
+Host: localhost:8080
+Authorization: Bearer <token>
+```
+
+| Parameter  | Required | Description |
+|------------|----------|-------------|
+| `email`    | yes | customer email (case-insensitive) |
+| `status`   | no  | `pending`, `completed`, `failed`, `cancelled`; comma-separated or repeated |
+| `limit`    | no  | page size, default 20, max 100 |
+| `brand_id` | no  | restricts the lookup to one brand; required when the email exists in several of the token's brands |
+| `cursor`   | no  | `page.next_cursor` of the previous page |
+
+```json
+{
+  "request_id": "01a1d02c-887f-749a-8635-0b7ec8879418",
+  "customer": {"id": "1001", "brand_id": 1, "brand": "Vyking Casino", "currency": "EUR", "active": true},
+  "transactions": [
+    {
+      "id": "42", "type": "payin", "amount": 123.45, "currency": "EUR",
+      "status": "completed", "status_detail": "settled", "failure_reason": null,
+      "payment_method": "PAYIN CARD",
+      "created_at": "2026-11-01T10:00:00Z", "booked_at": "2026-11-01T10:01:00Z",
+      "settled_at": "2026-11-01T11:00:00Z", "updated_at": "2026-11-01T11:00:00Z"
+    }
+  ],
+  "page": {"limit": 20, "has_more": true, "next_cursor": "eyJ2IjoxLCJj..."}
+}
+```
+
+- Amounts are JSON numbers in the customer's currency (exact decimals, e.g. `1000` JPY, `1.234` BHD), `null` when unknown.
+- Timestamps are RFC 3339 UTC. `settled_at` is set for settled transactions only.
+- `status` uses Acme Support's vocabulary; `status_detail` and `failure_reason` refine it (mapping in [NOTES.md](NOTES.md)).
+- Every response carries `X-Request-ID`; errors look like
+  `{"error": {"code": "customer_not_found", "message": "...", "request_id": "..."}}`.
+
+| HTTP | Code | When |
+|------|------|------|
+| 400 | `invalid_parameter`, `invalid_cursor` | bad query parameter / cursor from a different query |
+| 401 | `unauthorized`, `token_malformed`, `token_expired`, `token_invalid` | missing or rejected token |
+| 403 | `insufficient_scope`, `brand_forbidden` | token lacks `transactions:read` / `brand_id` not in the token |
+| 404 | `customer_not_found` | no such email in the token's brands |
+| 409 | `customer_ambiguous` | email exists in several of the token's brands; `details.brand_ids` lists them |
+| 503 | `service_unavailable` | database temporarily unavailable, retry later |
+
+Try it with the compose stack:
+
+```sh
+make up seed
+eval "$(make -s tokens)"
+curl -s -H "Authorization: Bearer $TOKEN_VALID_BRAND_1" \
+  'localhost:8080/v1/transactions?email=jane.doe@example.com&limit=5' | jq
+```
+
 ## Partner authentication
 
 The partner API expects `Authorization: Bearer <token>`, where the token is an HS256 JWT issued by us that lists the brands
@@ -118,8 +175,17 @@ go tool pprof -top 'http://pprof:pprof-dev-only@localhost:9090/debug/pprof/heap'
 ## Development
 
 ```sh
-make help    # list all targets
-make test    # unit tests (race detector)
-make build   # build bin/server
-make run     # run locally with APP_ENV=local
+make help              # list all targets
+make test              # unit tests (race detector)
+make test-integration  # integration tests against a throwaway MySQL (see below)
+make build             # build bin/server
+make run               # run on the host with APP_ENV=local (after `make deps-up`)
 ```
+
+### Integration tests
+
+`make test-integration` starts a **separate, throwaway** MySQL (compose project `vyking-3pi-it`, port 33306, tmpfs
+storage), applies the real Flyway migrations, runs `go test -tags=integration ./test/integration/...` and **always** tears
+the containers down. A failure exits non-zero, so CI can run the very same target. The tests run the complete service
+(config, auth, service, repositories) against MySQL as the least-privilege `app` user and talk to it over HTTP; the
+development database is never touched.

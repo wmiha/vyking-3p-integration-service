@@ -81,6 +81,8 @@ func testConfig(t *testing.T, publicEnabled bool, drain time.Duration) *config.C
 			Public:           srv(freeAddr(t), publicEnabled),
 			Internal:         srv(freeAddr(t), true),
 		},
+		Auth:       config.Auth{Issuer: "i", Audience: "a", Keys: []config.AuthKey{{ID: "k", Secret: "test-secret-0123456789-0123456789"}}},
+		PartnerAPI: config.PartnerAPI{DefaultLimit: 20, MaxLimit: 100},
 		Database: config.Database{
 			StartupTimeout: 2 * time.Second,
 			QueryTimeout:   time.Second,

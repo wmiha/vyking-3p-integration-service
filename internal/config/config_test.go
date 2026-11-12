@@ -36,6 +36,7 @@ server:
     read_timeout: 2s
     write_timeout: 3s
     idle_timeout: 4s
+partner_api: {default_limit: 20, max_limit: 100}
 ` + databaseYAML
 
 const databaseYAML = `
@@ -374,4 +375,34 @@ func TestAuthConfig(t *testing.T) {
 			assert.Equal(t, tt.wantKeys, ids)
 		})
 	}
+}
+
+func TestPartnerAPIConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		limits  string
+		wantErr bool
+	}{
+		{name: "valid", limits: "{default_limit: 20, max_limit: 100}"},
+		{name: "default above max", limits: "{default_limit: 50, max_limit: 10}", wantErr: true},
+		{name: "zero default", limits: "{default_limit: 0, max_limit: 10}", wantErr: true},
+		{name: "max above ceiling", limits: "{default_limit: 20, max_limit: 1000}", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := strings.Replace(validYAML, "partner_api: {default_limit: 20, max_limit: 100}", "partner_api: "+tt.limits, 1)
+			cfg, err := Parse([]byte(raw), mapLookup(nil))
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "partner_api limits must satisfy")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, PartnerAPI{DefaultLimit: 20, MaxLimit: 100}, cfg.PartnerAPI)
+		})
+	}
+
+	// A sync-only instance needs no partner API settings.
+	raw := strings.Replace(validYAML, "partner_api: {default_limit: 20, max_limit: 100}", "", 1)
+	_, err := Parse([]byte(raw), mapLookup(map[string]string{"PUBLIC_ENABLED": "false"}))
+	assert.NoError(t, err)
 }

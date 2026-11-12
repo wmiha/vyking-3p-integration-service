@@ -72,6 +72,9 @@ func driverConfig(cfg Config) (*mysql.Config, error) {
 	dsn.Timeout = cfg.ConnectTimeout
 	dsn.ReadTimeout = cfg.ReadTimeout
 	dsn.WriteTimeout = cfg.WriteTimeout
+	// Bind parameters client-side: one round trip per query instead of a
+	// server-side prepare + execute. Safe with the utf8mb4 connection charset.
+	dsn.InterpolateParams = true
 	return dsn, nil
 }
 

@@ -1,0 +1,51 @@
+# Throwaway database for integration tests (`make test-integration`).
+#
+# A separate compose project with its own port and tmpfs storage: it never
+# touches the development database, starts from an empty schema migrated by
+# the same Flyway migrations, and disappears after the run. CI runs the very
+# same target.
+name: vyking-3pi-it
+
+services:
+  mysql:
+    image: mysql:8.4.13
+    command:
+      - --innodb-buffer-pool-size=64M
+      - --performance-schema=OFF
+      - --skip-name-resolve
+      - --max-connections=50
+    environment:
+      MYSQL_ROOT_PASSWORD: it-root-only
+      MYSQL_DATABASE: vyking
+    ports:
+      - "${IT_DB_PORT:-33306}:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pit-root-only --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 60s
+      start_interval: 1s
+    mem_limit: 512m
+
+  flyway:
+    image: flyway/flyway:13.12.1-alpine
+    command: migrate
+    environment:
+      FLYWAY_URL: jdbc:mysql://mysql:3306/vyking?allowPublicKeyRetrieval=true&useSSL=false
+      FLYWAY_USER: root
+      FLYWAY_PASSWORD: it-root-only
+      FLYWAY_LOCATIONS: filesystem:/flyway/migrations,filesystem:/flyway/callbacks
+      FLYWAY_CONNECT_RETRIES: "30"
+      FLYWAY_PLACEHOLDERS_APP_USER: app
+      FLYWAY_PLACEHOLDERS_APP_PASSWORD: it-app-only
+      JAVA_ARGS: -Xmx128m
+    volumes:
+      - ./db/migrations:/flyway/migrations:ro
+      - ./db/callbacks:/flyway/callbacks:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    mem_limit: 384m
