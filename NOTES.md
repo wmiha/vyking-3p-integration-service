@@ -26,3 +26,17 @@ Questions, assumptions, identified problems, decisions and trade-offs. This docu
   is appropriate.
 - Every response carries `X-Request-ID` (UUIDv7, time-ordered). A caller-supplied id is reused only if it is a short
   `[A-Za-z0-9._-]` token, which prevents header/log injection.
+
+### Runtime, probes and shutdown
+
+- **Two listeners.** The public server (`:8080`) only serves the partner API. Probes, metrics, profiling and the sync
+  trigger live on an internal server (`:9090`) that is exposed through a ClusterIP service only and never through the
+  ingress. This is also how the sync satisfies "must not be publicly accessible".
+- **Liveness vs readiness.** `/health` only proves the process serves HTTP, so a database outage does not cause restart
+  loops. `/ready` checks dependencies and turns 503 while draining.
+- **Graceful shutdown.** The first SIGTERM flips readiness to 503 and waits `drain_delay` so the load balancer stops sending
+  traffic, then drains the public server, then the internal server, all within `shutdown_timeout`. A second signal forces an
+  immediate exit (logged). `terminationGracePeriodSeconds` must exceed `drain_delay + shutdown_timeout`.
+- Access logs record the matched route, never the query string, because it carries customer emails.
+- Known limitation: requests rejected by `net/http` itself before routing (malformed request line, path-cleaning
+  redirects) get the standard library's plain-text responses rather than the JSON error envelope.

@@ -13,6 +13,7 @@ log:
 server:
   shutdown_timeout: 40s
   drain_delay: 0s # nothing routes traffic to a laptop
+  readiness_timeout: 2s # per /ready dependency check
   public:
     enabled: ${PUBLIC_ENABLED:-true}
     addr: "${PUBLIC_ADDR:-:8080}"

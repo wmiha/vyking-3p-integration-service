@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ log:
 server:
   shutdown_timeout: 30s
   drain_delay: 5s
+  readiness_timeout: 2s
   public:
     enabled: ${PUBLIC_ENABLED:-true}
     addr: "${PUBLIC_ADDR:-:8080}"
@@ -112,6 +114,7 @@ server:
 				`app.env "qa" must be one of`,
 				`log.format "xml" must be text or json`,
 				"server.drain_delay must be >= 0 and shorter than server.shutdown_timeout",
+				"server.readiness_timeout must be positive",
 				"server.internal.read_timeout must be positive",
 				"server.public.addr and server.internal.addr must differ",
 			},
@@ -124,6 +127,7 @@ log: {level: info, format: text}
 server:
   shutdown_timeout: 5s
   drain_delay: 0s
+  readiness_timeout: 1s
   public: {enabled: false}
   internal: {addr: ":9090", read_header_timeout: 1s, read_timeout: 1s, write_timeout: 1s, idle_timeout: 1s}
 `,
@@ -172,8 +176,17 @@ func TestLoad(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "svc", cfg.App.Name)
 
-	_, err = Load(mapLookup(map[string]string{VarEnv: "missing", VarDir: dir}))
+	_, err = Load(mapLookup(map[string]string{VarEnv: "staging", VarDir: dir}))
 	require.ErrorContains(t, err, "read config")
+
+	_, err = Load(mapLookup(map[string]string{VarEnv: "../dev", VarDir: dir}))
+	require.ErrorContains(t, err, `APP_ENV="../dev" must be one of local, dev, staging, prod`)
+
+	fixed := filepath.Join(dir, "fixed.yaml")
+	require.NoError(t, os.WriteFile(fixed, []byte(strings.Replace(validYAML, "${APP_ENV:-local}", "dev", 1)), 0o600))
+	cfg, err = Load(mapLookup(map[string]string{VarEnv: "ignored", VarPath: fixed}))
+	require.NoError(t, err, "APP_ENV is irrelevant when CONFIG_PATH is set")
+	assert.Equal(t, "svc", cfg.App.Name)
 }
 
 // TestShippedConfigs guards the files in /config against typos and drift.

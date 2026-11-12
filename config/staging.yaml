@@ -12,6 +12,7 @@ server:
   # terminationGracePeriodSeconds must exceed drain_delay + shutdown_timeout.
   shutdown_timeout: 45s
   drain_delay: 5s # let the endpoints controller remove the pod first
+  readiness_timeout: 2s # per /ready dependency check
   public:
     enabled: ${PUBLIC_ENABLED:-true}
     addr: ":8080"

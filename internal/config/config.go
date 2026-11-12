@@ -26,6 +26,8 @@ const (
 	EnvProd    = "prod"
 )
 
+var environments = []string{EnvLocal, EnvDev, EnvStaging, EnvProd}
+
 // Environment variables that select the configuration file.
 const (
 	VarEnv  = "APP_ENV"     // local|dev|staging|prod, defaults to local
@@ -58,8 +60,10 @@ type Server struct {
 	// DrainDelay keeps serving after readiness turns unhealthy so load
 	// balancers can stop routing traffic before listeners close.
 	DrainDelay time.Duration `yaml:"drain_delay"`
-	Public     HTTPServer    `yaml:"public"`
-	Internal   HTTPServer    `yaml:"internal"`
+	// ReadinessTimeout bounds the dependency checks behind /ready.
+	ReadinessTimeout time.Duration `yaml:"readiness_timeout"`
+	Public           HTTPServer    `yaml:"public"`
+	Internal         HTTPServer    `yaml:"internal"`
 }
 
 type HTTPServer struct {
@@ -92,6 +96,11 @@ func Path(lookup LookupFunc) string {
 // Load reads, expands, decodes and validates the configuration file selected
 // by Path.
 func Load(lookup LookupFunc) (*Config, error) {
+	if p, _ := lookup(VarPath); p == "" {
+		if env, _ := lookup(VarEnv); env != "" && !slices.Contains(environments, env) {
+			return nil, fmt.Errorf("%s=%q must be one of %s", VarEnv, env, strings.Join(environments, ", "))
+		}
+	}
 	path := Path(lookup)
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -176,7 +185,7 @@ func (c *Config) Validate() error {
 	if c.App.Name == "" {
 		errs = append(errs, errors.New("app.name is required"))
 	}
-	if !slices.Contains([]string{EnvLocal, EnvDev, EnvStaging, EnvProd}, c.App.Env) {
+	if !slices.Contains(environments, c.App.Env) {
 		errs = append(errs, fmt.Errorf("app.env %q must be one of local, dev, staging, prod", c.App.Env))
 	}
 	if c.Log.Format != "text" && c.Log.Format != "json" {
@@ -193,6 +202,9 @@ func (s *Server) validate() []error {
 	}
 	if s.DrainDelay < 0 || s.DrainDelay >= s.ShutdownTimeout {
 		errs = append(errs, errors.New("server.drain_delay must be >= 0 and shorter than server.shutdown_timeout"))
+	}
+	if s.ReadinessTimeout <= 0 {
+		errs = append(errs, errors.New("server.readiness_timeout must be positive"))
 	}
 	if s.Public.Enabled {
 		errs = append(errs, s.Public.validate("server.public")...)
