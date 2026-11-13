@@ -17,11 +17,13 @@ Design decisions, assumptions and open questions are documented in [NOTES.md](NO
 ## Quick start (Docker)
 
 ```sh
-make up      # build the image, start MySQL, apply Flyway migrations, start the service (waits until healthy)
+make up        # build the images, start MySQL + Flyway migrations, the Acme mock and the service (waits until healthy)
+make seed      # load sample customers, transactions and sync queue entries (the sync starts pushing them)
 curl localhost:9090/ready
-make logs    # follow service logs
-make down    # stop, keep data (named volume survives restarts)
-make clean   # stop and delete the data volume for a fresh start
+make logs      # follow service logs
+make obs-up    # optional: add Prometheus (:9091) and Grafana (:3000) with the provisioned dashboard
+make down      # stop, keep data (named volume survives restarts)
+make clean     # stop and delete the data volume for a fresh start
 ```
 
 | Service  | Port | Notes |
@@ -31,7 +33,9 @@ make clean   # stop and delete the data volume for a fresh start
 | `flyway` | –    | one-shot: applies `db/migrations`, then creates the least-privilege `app` user |
 | `acmemock` | 8081 | stand-in for Acme Support: the documented contract, one account per API key, 60/min + burst 10 with `Retry-After`, optional latency and 5xx injection (`ACME_MOCK_*`); state at `/_debug/contacts`, counters at `/_debug/stats` |
 
-To run the service on the host instead: `make deps-up` (MySQL + migrations only), then `make run`.
+| `prometheus`, `grafana` | 9091, 3000 | only with `make obs-up` (compose profile `observability`) |
+
+To run the service on the host instead: `make deps-up` (MySQL, migrations and the Acme mock), then `make run`.
 
 ## Partner API
 
@@ -218,7 +222,12 @@ Main environment variables (see the YAML files for every tunable):
 |--------------------|-------------------------------------------------------------------------|
 | `GET /health`      | Liveness: the process is serving HTTP                                   |
 | `GET /ready`       | Readiness: dependencies reachable, not shutting down                    |
+| `GET /metrics`     | Prometheus metrics (see "Observability")                                |
+| `POST /internal/sync/run` | Start a contact sync cycle now                                   |
+| `GET /internal/sync/status` | Summary of the last sync cycle                                 |
 | `/debug/pprof/*`   | Go profiler behind Basic auth (`PPROF_ENABLED`, `PPROF_USERNAME`, `PPROF_PASSWORD`) |
+
+The internal port must only be reachable inside the cluster (ClusterIP service, never the ingress).
 
 ```sh
 go tool pprof -top 'http://pprof:pprof-dev-only@localhost:9090/debug/pprof/heap'   # local defaults
@@ -234,10 +243,38 @@ make build             # build bin/server
 make run               # run on the host with APP_ENV=local (after `make deps-up`)
 ```
 
-### Integration tests
+### Tests
 
-`make test-integration` starts a **separate, throwaway** MySQL (compose project `vyking-3pi-it`, port 33306, tmpfs
-storage), applies the real Flyway migrations, runs `go test -tags=integration ./test/integration/...` and **always** tears
-the containers down. A failure exits non-zero, so CI can run the very same target. The tests run the complete service
-(config, auth, service, repositories) against MySQL as the least-privilege `app` user and talk to it over HTTP; the
-development database is never touched.
+- **Unit tests** (`make test`, race detector on): table-driven with testify and hand-written fakes. Time-dependent code
+  (rate limiter, cache TTL, sync scheduler, shutdown) is tested deterministically with `testing/synctest`; HTTP clients
+  and handlers run against `httptest`.
+- **Integration tests** (`make test-integration`) start a **separate, throwaway** stack: MySQL on tmpfs (compose project
+  `vyking-3pi-it`, port 33306) migrated by the real Flyway, plus an Acme mock (port 18081). They run
+  `go test -tags=integration -p 1` and **always** tear the containers down. A failure exits non-zero, so CI can run the
+  very same target, and the development database is never touched. They cover:
+  - the complete service over HTTP (config, auth, partner API, contact sync against the mock), connected as the
+    least-privilege `app` user;
+  - database-level checks: atomic recording, leader election when the lock session dies, fair per-brand fetching, and
+    the query plan (rows read per page).
+- **End-to-end checks** were run against the full compose stack after every major part: auth matrix, pagination
+  against SQL, outage and recovery, graceful shutdown, SIGKILL mid-sync, two replicas, Acme throttling and failures,
+  refused keys, metrics. NOTES.md records the findings and the fixes they led to.
+
+## Project layout
+
+```
+cmd/server/                 entrypoint (+ `healthcheck` subcommand for distroless images)
+internal/app/               composition root: wiring, start-up, graceful shutdown
+internal/config/            per-environment YAML with ${VAR:-default} expansion and validation
+internal/domain/            business types and rules (status mapping, amounts, contacts) - no dependencies
+internal/service/           use cases with their ports: transactions (partner API), contactsync (sync)
+internal/adapter/           handler (HTTP in), repository (MySQL), acme (Acme Support client), cache
+internal/auth/              partner JWT verification
+internal/apierror/          the client-facing error model
+internal/platform/          logging, database (pools, WithTx), ratelimit, health, metrics, requestid
+db/                         Flyway migrations + least-privilege user callback (local/test only)
+config/                     local, dev, staging, prod configuration
+scripts/                    seed, tokengen, acmemock (development tools)
+test/integration/           end-to-end tests against the throwaway stack
+deploy/observability/       Prometheus scrape config, Grafana provisioning and dashboard
+```

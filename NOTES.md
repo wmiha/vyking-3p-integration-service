@@ -1,6 +1,88 @@
 # NOTES
 
-Questions, assumptions, identified problems, decisions and trade-offs. This document grows with the implementation.
+The summary lists the questions, assumptions, problems and decisions in short form. The sections after it explain each
+decision, its alternatives and its trade-offs. "Load and scalability" and "What remains" are at the end.
+
+## Summary
+
+### Questions we would ask
+
+*Business and data*
+1. Is the status mapping right? In particular, reversed and chargeback are reported as `completed`, approved and booked
+   as `pending`. May risk declines be disclosed to a third party, or must they stay a generic `declined`?
+2. Is there a real settlement timestamp anywhere? `TRX_dBooked` means "accepted for processing".
+3. Transactions have no currency. Can a customer's currency change? Are payouts and adjustments stored as negative
+   amounts? Why can amounts be NULL?
+4. What does "recent" mean for Acme: a time window, a maximum history?
+5. Should inactive customers be synced and returned? (We do both.)
+6. Who writes `sync_queue`, and in the same transaction as the customer change (a true outbox)? What are the expected
+   volumes: brands, customers per brand, queue inflow, partner API QPS and latency SLO?
+7. Are the zone-less `DATETIME` columns UTC?
+8. Can the schema owners add the recommended indexes, or give the service a status column or its own schema?
+
+*Authentication*
+
+9. How can Acme Support send credentials: a static bearer header or OAuth 2.0 client credentials? One token per brand,
+   or one covering several? What lifetime, rotation and revocation process?
+10. Should inbound requests be rate-limited per partner?
+
+*Acme Support API*
+
+11. Can a `409` return the existing contact id, or can contacts be looked up by `external_id`?
+12. What does the email lookup return, and what does it answer when nothing matches?
+13. Is PATCH a full replace or a partial update, and how is a field cleared?
+14. Are emails unique per account (contacts created manually by agents)?
+15. Is there a DELETE endpoint, for GDPR erasure and for customers who change brand?
+16. Which phone and country formats are accepted?
+17. Is an `Idempotency-Key` header supported?
+18. Is a bulk import available for the initial backfill? About 50 contacts per minute per brand means about 33 hours per
+    100k customers.
+
+### Assumptions we made to proceed
+
+- The schema is fixed and owned elsewhere. We run its migrations only locally and in tests, and we write only
+  `sync_queue.SYQ_dProcessed` and `partner_contacts`. The second point is enforced by the database user's grants.
+- `DATETIME` values are UTC.
+- A transaction's currency is the customer's current currency. Amounts are returned as stored; NULL stays `null`.
+- Unknown currency minor units fall back to ISO 4217, and an amount is never guessed.
+- Partners receive HS256 JWTs that we issue, listing their brands and the `transactions:read` scope.
+- An email lookup is case-insensitive but otherwise exact; emails are unique only per brand.
+- Brand API keys come from configuration and secrets; brands without a key are not synced.
+- Acme's lookup answers `{"id": ...}` or `404`, and PATCH accepts the full contact.
+- 55 requests per minute per brand leaves headroom under Acme's 60/min in case other clients share the key.
+
+### Potential problems and ambiguities identified
+
+- **The schema cannot express parts of the required response:** there is no settlement timestamp, no failure reason and
+  no transaction currency, and USD has NULL minor units. See "Partner API: data gaps".
+- **Customer lookup by email:** emails are unique per brand only, so a multi-brand token can be ambiguous. Customers
+  without email cannot be looked up. The default collation also ignores accents and would return another customer
+  (fixed).
+- **`sync_queue` has no status, attempts or error columns**, so failed entries cannot be parked durably. There is also
+  no index on `SYQ_dProcessed`: every poll scans a table that only grows.
+- **A `409` from Acme does not carry the contact id, and lookup works by email only.** A crash between Acme's create
+  and our write can leave a customer unresolvable. We reproduced this for a customer without email.
+- **Rate limits:** Acme's per-key limit caps throughput and is shared by all replicas, hence the leader election.
+- **No DELETE in Acme's API:** erasure and brand moves cannot be propagated.
+- **Emails in query strings** are PII in proxy logs. Inactive customers are visible to support (to confirm).
+- **A query-plan trap.** Joining the tiny lookup tables made MySQL sort a customer's whole history on every page. This
+  was found and fixed, and a test now guards it.
+
+### Key decisions and trade-offs
+
+- **Hexagonal layout, stdlib first.** Small consumer-declared interfaces and one place for client errors (`apierror`).
+  Dependencies are limited to the MySQL driver, JWT, YAML, testify and the Prometheus client.
+- **Two listeners.** The public port serves only the partner API. Probes, metrics, pprof (Basic auth) and the sync
+  trigger live on an internal port.
+- **The sync never drops an entry**, and its delivery is at-least-once with idempotent effects. It uses leader election
+  through a MySQL named lock, fair per-brand batches, per-brand rate limits and circuit breakers. Recording happens in
+  one transaction.
+- **Ambiguous emails return `409 customer_ambiguous`** with the brand ids. Other brands' customers answer `404`.
+- **Keyset pagination** uses a cursor bound to the customer and filter, plus a short-TTL cache keyed by the caller's
+  brand scope.
+- **Primary/replica pools.** The sync stays on the primary; partner reads use the replica.
+- **Throwaway integration databases** are migrated by the real Flyway, and each part was verified against the running
+  compose stack.
 
 ## Decisions and trade-offs
 
@@ -313,3 +395,82 @@ covering several brands? Acceptable lifetime and rotation process? Should inboun
   concurrent CPU profile) remain plain text.
 - Known limitation: requests rejected by `net/http` itself before routing (malformed request line, path-cleaning
   redirects) get the standard library's plain-text responses rather than the JSON error envelope.
+
+## Load and scalability
+
+The task gives no volumes. These are the questions we would ask first, followed by how the design responds as load grows.
+
+**Questions.** How many brands, and how many customers per brand? What is the peak `sync_queue` inflow (entries per
+second)? What partner API QPS and latency SLO does Acme expect? How fast is `transactions` growing?
+
+**Writes by this service are small.** Every synced customer costs one short transaction (an upsert plus one UPDATE).
+Acme's rate limit caps that at about one transaction per second per brand, so 50 brands mean about 50 transactions per
+second. MySQL is not the bottleneck here; Acme's limit is. The real write volume belongs to the producers (customer
+changes, transactions). Processed `sync_queue` rows are never deleted and need a retention or archiving job;
+partitioning by `SYQ_dQueued` would be the schema owners' call.
+
+**Reads (partner API).** Each request is one email lookup on an index and one bounded index range scan (see "Query plan,
+measured"), and the cache absorbs the repeat lookups typical of ticket handling.
+- Reads go to a **read replica** with its own connection string and pool (`database.replica`). More replicas can sit
+  behind a reader endpoint or ProxySQL as read demand grows. A few seconds of replication lag is fine for support use.
+- The sync **never** reads from a replica (see "Database access").
+- A shared cache (Redis) would raise hit rates across pods; the port is ready for it.
+
+**Splitting the service when metrics show degradation.** One deployable currently holds two different workloads:
+- the partner API, which is latency-sensitive, scales out with read QPS and is light on CPU and IO;
+- the sync, a long-running worker bound by Acme's rate limit and latency, which needs exactly one leader.
+
+If they start to interfere, they become two deployments built from the same image: `PUBLIC_ENABLED=false` runs a
+sync-only worker and `SYNC_ENABLED=false` an API-only one. The signals to watch are:
+- API p99 latency or error rate rising during sync cycles;
+- CPU, memory or GC pressure (pprof, Go runtime metrics);
+- the two workloads needing different replica counts.
+
+The hexagonal layout makes the split a wiring change. A second `cmd/` entry point would only be cosmetic.
+
+**OLTP vs OLAP: keep heavy reads off the production OLTP database.** The primary carries critical writes (payments,
+customer changes). Serving a growing partner or analytics read load from it is not good practice, and neither is
+serving it from replicas of the same cluster: long scans, buffer-pool churn and replica lag all compete with the write
+path. How it would evolve:
+1. Now: read replica plus cache for the partner API's point lookups.
+2. Higher demand: **export changes with CDC** (Debezium reading the binlog into Kafka), feeding one or both of:
+   - a purpose-built read model for the partner API (a CQRS projection keyed by brand and email, with status mapping,
+     currency and amounts precomputed);
+   - a data warehouse or OLAP store (ClickHouse, BigQuery, Snowflake) for high-volume querying, reporting, BI dashboards
+     and sync auditing.
+3. The trade-offs are freshness within seconds (CDC lag, acceptable for support), new infrastructure, and data
+   governance: copies of PII, retention, and GDPR erasure that must also reach the warehouse.
+
+The same CDC stream can replace the polling relay: `sync_queue` inserts flow into a topic keyed by customer id, per-brand
+consumers sync at their rate limit, and a dead-letter topic takes over from the missing status column. That also removes
+the full scan on `SYQ_dProcessed`.
+
+**Sharding, only if one primary cannot keep up.**
+- Shard by **brand**, the natural tenant boundary: credentials, rate limits, partner scope and email uniqueness are all
+  per brand, and every query is brand-scoped already.
+- Brand sizes are very uneven, which risks hot spots. Use directory (lookup) sharding, so a big brand can get its own
+  shard, and hash `customer_id` *within* oversized brands. Per-customer queries stay on a single shard.
+- Never shard by time or by sequential id ranges: the newest shard would take all the writes.
+- Email lookups route by brand; multi-brand tokens fan out to a few shards.
+
+## Recommended indexes (for the schema owners; we did not change the schema)
+
+| Index | Why |
+|---|---|
+| `sync_queue (SYQ_dProcessed, SYQ_iID)` | the sync's fetch of outstanding entries currently scans the whole, ever-growing table |
+| `transactions (TRX_CUS_iID, TRX_STA_iID, TRX_dCreated)` | only for customers with long histories that are mostly filtered out by status; costs write amplification on a hot table, so measure first |
+| drop `customers KEY (CUS_BRD_iID)` | redundant: it is the prefix of `UNIQUE (CUS_BRD_iID, CUS_cEmail)` |
+
+The existing `(TRX_CUS_iID, TRX_dCreated)` and `(CUS_BRD_iID, CUS_cEmail)` / `CUS_cEmail` keys serve the partner API
+well.
+
+## What remains and what we would improve with more time
+
+- Durable sync state (status, attempts, last error columns, or a service-owned table) plus an admin tool for parked
+  entries, replacing the in-memory backoff.
+- Inbound rate limiting and load shedding per partner on the public API.
+- Signed (HMAC) cursors if they ever carry authorization-relevant data.
+- OpenTelemetry tracing across the API, the database and Acme calls (request ids already propagate as `X-Request-ID`).
+- Kubernetes manifests (Deployment, PodDisruptionBudget, ClusterIP service for the internal port, NetworkPolicy), and
+  config delivered as ConfigMap plus Secret.
+- Contract tests against Acme's real sandbox once available; today the mock encodes our reading of the contract.
