@@ -8,6 +8,96 @@ Go service that integrates our customer database with the **Acme Support** platf
 
 Design decisions, assumptions and open questions are documented in [NOTES.md](NOTES.md).
 
+## Architecture
+
+One binary, run as several replicas. Each one serves the partner API on a public port and runs the contact sync in
+the background; a MySQL named lock lets only one replica sync at a time. Operational endpoints live on a separate,
+cluster-internal port.
+
+```mermaid
+flowchart LR
+    partner(["Acme Support<br/>support agents"])
+    acmeapi(["Acme Support API<br/>/v2/contacts"])
+    k8s(["probes, operators"])
+
+    subgraph svc["vyking-3p-integration-service (every replica)"]
+        direction LR
+        subgraph pubport["public :8080"]
+            mw["request id, access log,<br/>metrics, recover"]
+            authn["JWT auth<br/>HS256, brands, scope"]
+            api["GET /v1/transactions"]
+        end
+        subgraph intport["internal :9090 (cluster only)"]
+            ops["probes: /health /ready<br/>/metrics, /debug/pprof<br/>/internal/sync/run, /status"]
+        end
+        txsvc["transactions service<br/>brand scope, status mapping,<br/>amounts, cursor"]
+        cache[("cache<br/>15 s TTL")]
+        syncer["contact sync<br/>scheduler, per-brand workers,<br/>backoff"]
+        client["Acme client<br/>token bucket, retries,<br/>circuit breaker"]
+        prepo["Customers, Transactions<br/>repositories"]
+        srepo["Sync, Locker<br/>repositories"]
+    end
+
+    subgraph mysql["MySQL 8"]
+        replica[("replica<br/>partner reads")]
+        primary[("primary<br/>sync reads and writes,<br/>leader lock")]
+    end
+
+    prom["Prometheus"] --> grafana["Grafana"]
+
+    partner -->|"Bearer partner JWT"| mw --> authn --> api --> txsvc
+    txsvc <--> cache
+    txsvc --> prepo --> replica
+    syncer --> srepo --> primary
+    syncer --> client -->|"Bearer brand API key"| acmeapi
+    k8s --> ops
+    ops -.->|"trigger, status"| syncer
+    prom -->|"scrape /metrics"| ops
+```
+
+A sync cycle, as run by every replica on `sync.interval`, immediately again while there is a backlog, or on
+`POST /internal/sync/run`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Contact sync
+    participant DB as MySQL primary
+    participant A as Acme Support
+    S->>DB: GET_LOCK(sync lock, no wait)
+    alt another replica holds the lock
+        DB-->>S: 0, skip this cycle
+    else this replica is the leader
+        S->>DB: oldest outstanding sync_queue entries per brand, minus customers backing off
+        loop each customer, brands in parallel, N workers per brand
+            S->>DB: load the customer and its stored contact id
+            alt contact id known
+                S->>A: PATCH /v2/contacts/{id}
+            else new customer
+                S->>A: POST /v2/contacts with external_id = customer id
+                opt 409, created before a crash
+                    S->>A: GET /v2/contacts?email=...
+                    S->>A: PATCH /v2/contacts/{id}
+                end
+            end
+            S->>DB: one transaction: upsert partner_contacts, mark the fetched entries processed
+        end
+        S->>DB: RELEASE_LOCK
+    end
+    Note over S,A: Any failure leaves the entries outstanding, retried next cycle or after a per-customer backoff
+```
+
+The code follows a hexagonal (ports and adapters) layout; see [Project layout](#project-layout):
+
+- **Inbound adapter** `internal/adapter/handler`: routing, middleware, JWT check, request parsing, response mapping;
+  every client error goes through `internal/apierror`.
+- **Use cases** `internal/service/transactions` and `internal/service/contactsync` depend only on `internal/domain`
+  and on the small interfaces (ports) declared in their own `ports.go`.
+- **Outbound adapters** implement those ports: `repository` (MySQL, prepared statements), `acme` (HTTP client),
+  `cache` (in-process).
+- **Composition root** `internal/app` wires everything; `internal/platform` holds the infrastructure (connection pools
+  and `WithTx`, logging, metrics, rate limiter, health checks).
+
 ## Requirements
 
 - Go 1.27+
@@ -32,10 +122,14 @@ make clean     # stop and delete the data volume for a fresh start
 | `mysql`  | 3306 | MySQL 8.4 LTS, data in volume `vyking-3pi_mysql-data` |
 | `flyway` | –    | one-shot: applies `db/migrations`, then creates the least-privilege `app` user |
 | `acmemock` | 8081 | stand-in for Acme Support: the documented contract, one account per API key, 60/min + burst 10 with `Retry-After`, optional latency and 5xx injection (`ACME_MOCK_*`); state at `/_debug/contacts`, counters at `/_debug/stats` |
-
-| `prometheus`, `grafana` | 9091, 3000 | only with `make obs-up` (compose profile `observability`) |
+| `prometheus` | 9091 | only with `make obs-up` (compose profile `observability`); scrapes `app:9090/metrics`, keeps 2 days |
+| `grafana` | 3000 | only with `make obs-up`; anonymous viewer, the provisioned *Vyking 3P integration* dashboard is the home page (admin password `admin-dev-only`) |
 
 To run the service on the host instead: `make deps-up` (MySQL, migrations and the Acme mock), then `make run`.
+
+> **Docker inside WSL on Windows:** the published ports listen inside the WSL virtual machine. If `localhost:<port>`
+> does not reach them from Windows, use the WSL address instead: `wsl hostname -I` (first value), for example
+> `http://172.20.0.5:3000` for Grafana. The address changes when WSL restarts.
 
 ## Partner API
 
