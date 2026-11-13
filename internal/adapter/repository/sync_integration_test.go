@@ -95,32 +95,67 @@ func TestOutstandingIsFairPerBrand(t *testing.T) {
 		(7, 99, '2026-11-01 10:00:06', NULL),
 		(8, 1, '2026-11-01 09:00:00', '2026-11-01 09:01:00')`)
 
-	repo := NewSync(app, 5*time.Second, 3)
-	entries, err := repo.Outstanding(context.Background(), 3, []domain.CustomerID{2})
-	require.NoError(t, err)
+	repo := newSync(t, app)
 
 	type got struct {
 		id       uint64
 		customer domain.CustomerID
 		brand    domain.BrandID
 	}
-	var ids []got
-	for _, e := range entries {
-		ids = append(ids, got{e.ID, e.Customer, e.Brand})
-		assert.False(t, e.QueuedAt.IsZero())
+	tests := []struct {
+		name    string
+		exclude []domain.CustomerID
+		want    []got
+	}{
+		{
+			name:    "backing-off customer excluded",
+			exclude: []domain.CustomerID{2},
+			want: []got{
+				{7, 99, 0},                      // orphan: customer does not exist, surfaced with brand 0
+				{1, 1, 1}, {3, 1, 1}, {4, 3, 1}, // brand 1: oldest three, customer 2 excluded, entry 8 processed
+				{6, 7, 2}, // brand 2 is not starved by brand 1's backlog
+			},
+		},
+		{
+			name:    "nothing excluded",
+			exclude: nil,
+			want:    []got{{7, 99, 0}, {1, 1, 1}, {2, 2, 1}, {3, 1, 1}, {6, 7, 2}},
+		},
+		{
+			name:    "several customers excluded",
+			exclude: []domain.CustomerID{1, 2, 7},
+			want:    []got{{7, 99, 0}, {4, 3, 1}, {5, 4, 1}},
+		},
 	}
-	assert.Equal(t, []got{
-		{7, 99, 0},                      // orphan: customer does not exist, surfaced with brand 0
-		{1, 1, 1}, {3, 1, 1}, {4, 3, 1}, // brand 1: oldest three, customer 2 excluded, entry 8 processed
-		{6, 7, 2}, // brand 2 is not starved by brand 1's backlog
-	}, ids)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entries, err := repo.Outstanding(context.Background(), 3, tt.exclude)
+			require.NoError(t, err)
+
+			var ids []got
+			for _, e := range entries {
+				ids = append(ids, got{e.ID, e.Customer, e.Brand})
+				assert.False(t, e.QueuedAt.IsZero())
+			}
+			assert.Equal(t, tt.want, ids)
+		})
+	}
+}
+
+// newSync prepares a Sync repository on db for the duration of the test.
+func newSync(t *testing.T, db *sql.DB) *Sync {
+	t.Helper()
+	repo, err := NewSync(context.Background(), db, 5*time.Second, 3)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, repo.Close()) })
+	return repo
 }
 
 func TestLoadForSync(t *testing.T) {
 	root, app := rootDB(t), appDB(t)
 	resetSyncTables(t, root)
 	mustExec(t, root, `INSERT INTO partner_contacts VALUES (1, 'ct-1', UTC_TIMESTAMP())`)
-	repo := NewSync(app, 5*time.Second, 3)
+	repo := newSync(t, app)
 	ctx := context.Background()
 
 	c, err := repo.LoadForSync(ctx, 1)
@@ -147,7 +182,7 @@ func TestRecordSyncedIsAtomic(t *testing.T) {
 		(1, 1, '2026-11-01 10:00:00', NULL),
 		(2, 1, '2026-11-01 10:00:01', NULL),
 		(3, 3, '2026-11-01 10:00:02', NULL)`)
-	repo := NewSync(app, 5*time.Second, 3)
+	repo := newSync(t, app)
 	ctx := context.Background()
 
 	// PCO_cContactId is VARCHAR(64): the insert fails, so nothing may change.

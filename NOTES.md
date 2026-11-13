@@ -114,8 +114,27 @@ decision, its alternatives and its trade-offs. "Load and scalability" and "What 
 - **The replica is a hard dependency when enabled.** Start-up waits for it and `/ready` fails without it, so a replica
   outage takes partner reads down even though the primary could serve them. We would rather point `DB_REPLICA_HOST` at
   an endpoint that fails over by itself (RDS reader endpoint, ProxySQL) than build read failover into the service.
-- **Client-side parameter interpolation** (`interpolateParams`) saves a prepare/execute round trip per query. It is safe
-  with the utf8mb4 connection charset.
+- **Prepared statements, prepared once.** Every repository keeps its SQL as named constants at the top of its file
+  (`sqlSelectCustomersByEmail`, `sqlUpsertPartnerContact`, ...) and prepares them when it is created. `database/sql`
+  re-prepares a statement on each pooled connection that runs it, so the server parses each query once per connection,
+  and each later call is one binary-protocol round trip with the values sent apart from the SQL text. A broken query or
+  a missing grant fails the start-up, not the first request; that is why the service now prepares after waiting for
+  the database and before opening its listeners. An integration test asserts that repository calls cause no
+  `COM_STMT_PREPARE`.
+  - *Lists without dynamic SQL.* Brand, status and backoff lists are bound as one JSON array and expanded with
+    `JSON_TABLE` (`IN (SELECT ...)`, `NOT EXISTS (...)`), which MySQL materializes once per execution. Measured on 100k
+    outstanding entries with 500 excluded customers: `NOT EXISTS` matches a literal `NOT IN` list (~0.43 s), while
+    `MEMBER OF`, shorter to write, re-parses the JSON for every row (~6 s) and was rejected. On a 200k-transaction
+    history with a rare status filter (the worst case), the status filter costs about the same as `MEMBER OF` and the
+    page still walks the index backwards and stops early.
+  - *Marking entries processed* is one primary-key `UPDATE` per entry inside the recording transaction. It locks exactly
+    those rows; a set-based update over a list would leave the access path to the optimizer, and an `UPDATE` that scans
+    `sync_queue` locks every row it reads.
+  - *The leader lock is the exception.* A named lock belongs to one session, so its statements run on the lease's
+    dedicated connection and are bound client-side (`interpolateParams`, safe with the utf8mb4 charset).
+  - *Costs.* Server memory per prepared statement and connection: 7 statements × open connections × pods must stay
+    well below `max_prepared_stmt_count` (16382 by default). Requires MySQL 8.0.19+, which the `INSERT ... AS new` row
+    alias already did. Proxies that pool server sessions (ProxySQL, RDS Proxy) must support prepared statements.
 - **Timezones.** `DATETIME` columns carry no zone. We assume UTC (configurable per pool) and always write `UTC_TIMESTAMP()`.
 - **One transaction helper.** Every multi-statement write goes through `database.WithTx`: commit on success, rollback on
   error or panic, and bounded, jittered retries of the *whole* unit of work on deadlock (1213) or lock wait timeout (1205).
@@ -403,7 +422,8 @@ The task gives no volumes. These are the questions we would ask first, followed 
 **Questions.** How many brands, and how many customers per brand? What is the peak `sync_queue` inflow (entries per
 second)? What partner API QPS and latency SLO does Acme expect? How fast is `transactions` growing?
 
-**Writes by this service are small.** Every synced customer costs one short transaction (an upsert plus one UPDATE).
+**Writes by this service are small.** Every synced customer costs one short transaction (an upsert plus one
+primary-key UPDATE per coalesced queue entry, usually one).
 Acme's rate limit caps that at about one transaction per second per brand, so 50 brands mean about 50 transactions per
 second. MySQL is not the bottleneck here; Acme's limit is. The real write volume belongs to the producers (customer
 changes, transactions). Processed `sync_queue` rows are never deleted and need a retention or archiving job;

@@ -72,8 +72,10 @@ func driverConfig(cfg Config) (*mysql.Config, error) {
 	dsn.Timeout = cfg.ConnectTimeout
 	dsn.ReadTimeout = cfg.ReadTimeout
 	dsn.WriteTimeout = cfg.WriteTimeout
-	// Bind parameters client-side: one round trip per query instead of a
-	// server-side prepare + execute. Safe with the utf8mb4 connection charset.
+	// Repository queries are prepared statements (prepared once, executed in
+	// one round trip). Ad-hoc statements with arguments, such as the leader
+	// lock's, are bound client-side instead of costing a prepare + execute +
+	// close each time. Safe with the utf8mb4 connection charset.
 	dsn.InterpolateParams = true
 	return dsn, nil
 }

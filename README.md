@@ -191,6 +191,9 @@ Every fixture has outstanding `sync_queue` entries, some customers several (coal
   write only `sync_queue` and `partner_contacts`, so the "read-only except two tables" rule is enforced by the database.
 - The service waits up to `database.startup_timeout` for the database before opening its listeners, then exits non-zero
   so the orchestrator restarts it. `/ready` reports each connection pool separately.
+- Every query is a named constant at the top of its repository file (`internal/adapter/repository`) and is prepared
+  once at start-up, so a broken query or a missing grant stops the start instead of failing requests. Id lists are
+  bound as one JSON array parameter; no SQL text is built from request data.
 
 ## Configuration
 

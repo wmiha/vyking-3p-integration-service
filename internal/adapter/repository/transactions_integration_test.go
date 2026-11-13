@@ -4,6 +4,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/wmiha/vyking-3p-integration-service/internal/domain"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 	"github.com/wmiha/vyking-3p-integration-service/internal/service/transactions"
 )
@@ -25,12 +27,11 @@ func env(key, def string) string {
 	return def
 }
 
-// TestListPageCostIsProportionalToThePage guards the query plan: reading a
-// page must walk the index for about `limit` rows, never the customer's whole
-// history (which a hash join with the lookup tables used to cause).
-func TestListPageCostIsProportionalToThePage(t *testing.T) {
+// singleConnection opens a root pool with exactly one connection, so the
+// session status counters read by a test belong to its own queries.
+func singleConnection(t *testing.T) *sql.DB {
+	t.Helper()
 	port, _ := strconv.Atoi(env("IT_DB_PORT", "33306"))
-	// One connection, so the session status counters belong to our queries.
 	db, err := database.Open(database.Config{
 		Host: env("IT_DB_HOST", "127.0.0.1"), Port: port, Name: env("IT_DB_NAME", "vyking"),
 		User: "root", Password: env("IT_DB_ROOT_PASSWORD", "it-root-only"), Timezone: "UTC",
@@ -38,9 +39,35 @@ func TestListPageCostIsProportionalToThePage(t *testing.T) {
 		MaxOpenConns: 1, MaxIdleConns: 1,
 	})
 	require.NoError(t, err)
-	defer db.Close()
+	t.Cleanup(func() { db.Close() })
+	require.NoError(t, database.WaitReady(context.Background(), db, time.Second))
+	return db
+}
+
+// sessionStatus reads the named session status counters.
+func sessionStatus(t *testing.T, db *sql.DB, names ...string) map[string]int {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(),
+		"SHOW SESSION STATUS WHERE Variable_name IN ('"+strings.Join(names, "', '")+"')")
+	require.NoError(t, err)
+	defer rows.Close()
+	status := map[string]int{}
+	for rows.Next() {
+		var name string
+		var value int
+		require.NoError(t, rows.Scan(&name, &value))
+		status[name] = value
+	}
+	require.NoError(t, rows.Err())
+	return status
+}
+
+// TestListPageCostIsProportionalToThePage guards the query plan: reading a
+// page must walk the index for about `limit` rows, never the customer's whole
+// history (which a hash join with the lookup tables used to cause).
+func TestListPageCostIsProportionalToThePage(t *testing.T) {
+	db := singleConnection(t)
 	ctx := context.Background()
-	require.NoError(t, database.WaitReady(ctx, db, time.Second))
 
 	const customer, history = 7777, 3000
 	cleanup := func() {
@@ -62,15 +89,20 @@ func TestListPageCostIsProportionalToThePage(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	repo := NewTransactions(db, 10*time.Second)
+	repo, err := NewTransactions(ctx, db, 10*time.Second)
+	require.NoError(t, err)
+	defer repo.Close()
+
+	cursor := &transactions.Position{CreatedUnix: base.Add(1500 * time.Minute).Unix(), ID: 901500}
 	tests := []struct {
 		name  string
 		query transactions.PageQuery
 	}{
 		{"first page", transactions.PageQuery{Customer: customer, Limit: 21}},
 		{"status filter", transactions.PageQuery{Customer: customer, Limit: 21, StatusIDs: []uint32{70}}},
-		{"keyset page", transactions.PageQuery{Customer: customer, Limit: 21,
-			After: &transactions.Position{CreatedUnix: base.Add(1500 * time.Minute).Unix(), ID: 901500}}},
+		{"keyset page", transactions.PageQuery{Customer: customer, Limit: 21, After: cursor}},
+		{"keyset page with status filter", transactions.PageQuery{Customer: customer, Limit: 21,
+			StatusIDs: []uint32{60, 61}, After: cursor}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,19 +112,16 @@ func TestListPageCostIsProportionalToThePage(t *testing.T) {
 			page, err := repo.ListPage(ctx, tt.query)
 			require.NoError(t, err)
 			require.Len(t, page, 21)
-
-			status := map[string]int{}
-			rows, err := db.QueryContext(ctx, "SHOW SESSION STATUS WHERE Variable_name IN "+
-				"('Handler_read_prev', 'Handler_read_next', 'Handler_read_rnd_next', 'Sort_rows')")
-			require.NoError(t, err)
-			for rows.Next() {
-				var name string
-				var value int
-				require.NoError(t, rows.Scan(&name, &value))
-				status[name] = value
+			for _, tx := range page {
+				if len(tt.query.StatusIDs) > 0 {
+					assert.Contains(t, tt.query.StatusIDs, tx.StatusID, "status filter applied")
+				}
+				if tt.query.After != nil {
+					assert.Less(t, tx.ID, tt.query.After.ID, "page starts after the cursor")
+				}
 			}
-			require.NoError(t, rows.Close())
 
+			status := sessionStatus(t, db, "Handler_read_prev", "Handler_read_next", "Handler_read_rnd_next", "Sort_rows")
 			read := status["Handler_read_prev"] + status["Handler_read_next"]
 			// A third of the rows match the status filter, so it reads ~3x the page.
 			assert.Less(t, read, 100, "rows read from the index: %v", status)
@@ -100,4 +129,36 @@ func TestListPageCostIsProportionalToThePage(t *testing.T) {
 			assert.Less(t, status["Handler_read_rnd_next"], 100, "no table scans: %v", status)
 		})
 	}
+}
+
+// TestStatementsArePreparedOnce proves the partner API's queries are prepared
+// when the repositories are created and only executed afterwards.
+func TestStatementsArePreparedOnce(t *testing.T) {
+	db := singleConnection(t)
+	ctx := context.Background()
+
+	customers, err := NewCustomers(ctx, db, 5*time.Second)
+	require.NoError(t, err)
+	defer customers.Close()
+	txs, err := NewTransactions(ctx, db, 5*time.Second)
+	require.NoError(t, err)
+	defer txs.Close()
+
+	_, err = db.ExecContext(ctx, "FLUSH STATUS")
+	require.NoError(t, err)
+
+	const calls = 3
+	for range calls {
+		_, err := customers.FindByEmail(ctx, "nobody@example.com", []domain.BrandID{1, 2})
+		require.NoError(t, err)
+		_, err = txs.ListPage(ctx, transactions.PageQuery{Customer: 1, Limit: 5})
+		require.NoError(t, err)
+		_, err = txs.ListPage(ctx, transactions.PageQuery{Customer: 1, Limit: 5, StatusIDs: []uint32{60},
+			After: &transactions.Position{CreatedUnix: time.Now().Unix(), ID: 1}})
+		require.NoError(t, err)
+	}
+
+	status := sessionStatus(t, db, "Com_stmt_prepare", "Com_stmt_execute")
+	assert.Zero(t, status["Com_stmt_prepare"], "no statement is prepared per call: %v", status)
+	assert.Equal(t, 3*calls, status["Com_stmt_execute"], "every call executes a prepared statement: %v", status)
 }

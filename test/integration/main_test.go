@@ -133,7 +133,7 @@ func serviceConfig(t *testing.T) *config.Config {
 // startService runs the whole application until the test ends.
 func startService(t *testing.T, cfg *config.Config) {
 	t.Helper()
-	a, err := app.New(cfg, slog.New(slog.DiscardHandler), "it")
+	a, err := app.New(context.Background(), cfg, slog.New(slog.DiscardHandler), "it")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())

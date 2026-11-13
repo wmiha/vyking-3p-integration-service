@@ -52,12 +52,14 @@ func run(args []string) int {
 	// handler, format and service attributes.
 	slog.SetDefault(logger)
 
-	a, err := app.New(cfg, logger, version)
+	// Created before New so a signal also aborts waiting for the database.
+	ctx := shutdownOnSignal(logger)
+	a, err := app.New(ctx, cfg, logger, version)
 	if err != nil {
 		logger.Error("start-up failed", "error", err)
 		return 1
 	}
-	if err := a.Run(shutdownOnSignal(logger)); err != nil {
+	if err := a.Run(ctx); err != nil {
 		logger.Error("service failed", "error", err)
 		return 1
 	}

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -47,6 +48,9 @@ type App struct {
 	// reads and is the primary itself when no replica is configured.
 	primary *sql.DB
 	replica *sql.DB
+	// repositories hold prepared statements; they are closed before the
+	// pools.
+	repositories []io.Closer
 	// cache holds partner lookups; nil when disabled.
 	cache *cache.Memory[transactions.Result]
 
@@ -62,9 +66,12 @@ type App struct {
 	syncDone chan struct{}
 }
 
-// New wires the application. It opens connection pools lazily and does not
-// open listeners; Run does both. version labels the build_info metric.
-func New(cfg *config.Config, logger *slog.Logger, version string) (*App, error) {
+// New wires the application. It opens the connection pools and waits up to
+// database.startup_timeout for them, because the repositories prepare their
+// statements here: a broken query or a missing grant fails the start-up, not
+// the first request. It does not open listeners; Run does. Cancelling ctx
+// aborts the wait. version labels the build_info metric.
+func New(ctx context.Context, cfg *config.Config, logger *slog.Logger, version string) (*App, error) {
 	a := &App{
 		cfg:     cfg,
 		logger:  logger,
@@ -77,36 +84,57 @@ func New(cfg *config.Config, logger *slog.Logger, version string) (*App, error) 
 	if err := a.openDatabases(); err != nil {
 		return nil, err
 	}
+	if err := a.waitForDatabases(ctx); err != nil {
+		return nil, errors.Join(err, a.closeDatabases())
+	}
+	if err := a.wire(ctx); err != nil {
+		return nil, errors.Join(err, a.closeDatabases())
+	}
+	return a, nil
+}
 
+// wire builds the repositories, use cases and HTTP servers.
+func (a *App) wire(ctx context.Context) error {
+	cfg := a.cfg
 	internalDeps := handler.InternalDeps{
-		Logger:    logger,
+		Logger:    a.logger,
 		Readiness: a.health,
 		Profiler:  profiler(cfg.Pprof),
 		Metrics:   a.metrics.Handler(),
 		Requests:  a.metrics,
 	}
 	if cfg.Sync.Enabled {
-		a.syncer = a.contactSync()
-		internalDeps.Sync = a.syncer
+		syncer, err := a.contactSync(ctx)
+		if err != nil {
+			return err
+		}
+		a.syncer = syncer
+		internalDeps.Sync = syncer
 	}
-	a.internal = newHTTPServer(cfg.Server.Internal, logger, handler.NewInternalRouter(internalDeps))
+	a.internal = newHTTPServer(cfg.Server.Internal, a.logger, handler.NewInternalRouter(internalDeps))
 	internalCtx, cancelInternal := context.WithCancel(context.Background())
 	a.internal.BaseContext = func(net.Listener) context.Context { return internalCtx }
 	a.cancelInternal = cancelInternal
 
 	if cfg.Server.Public.Enabled {
-		public, err := a.partnerAPI()
+		public, err := a.partnerAPI(ctx)
 		if err != nil {
-			return nil, errors.Join(err, a.closeDatabases())
+			return err
 		}
-		a.public = newHTTPServer(cfg.Server.Public, logger, public)
+		a.public = newHTTPServer(cfg.Server.Public, a.logger, public)
 	}
-	return a, nil
+	return nil
 }
 
 // contactSync wires the scheduled sync. It reads and writes the primary only:
 // a lagging replica could make it push stale data and mark it processed.
-func (a *App) contactSync() *contactsync.Syncer {
+func (a *App) contactSync(ctx context.Context) (*contactsync.Syncer, error) {
+	store, err := repository.NewSync(ctx, a.primary, a.cfg.Database.QueryTimeout, a.cfg.Database.TxMaxRetries)
+	if err != nil {
+		return nil, fmt.Errorf("sync repository: %w", err)
+	}
+	a.repositories = append(a.repositories, store)
+
 	ac := a.cfg.Acme
 	keys := make(map[domain.BrandID]string)
 	var brands []domain.BrandID
@@ -131,7 +159,6 @@ func (a *App) contactSync() *contactsync.Syncer {
 	}, nil, a.logger)
 
 	sc := a.cfg.Sync
-	store := repository.NewSync(a.primary, a.cfg.Database.QueryTimeout, a.cfg.Database.TxMaxRetries)
 	return contactsync.New(contactsync.Config{
 		Interval:           sc.Interval,
 		BatchPerBrand:      sc.BatchPerBrand,
@@ -151,12 +178,12 @@ func (a *App) contactSync() *contactsync.Syncer {
 		Finder:    client,
 		Logger:    a.logger,
 		Observer:  a.metrics,
-	})
+	}), nil
 }
 
 // partnerAPI wires the public, partner-facing API. Its reads go to the
 // replica pool (the primary when no replica is configured).
-func (a *App) partnerAPI() (http.Handler, error) {
+func (a *App) partnerAPI(ctx context.Context) (http.Handler, error) {
 	keys := make([]auth.Key, 0, len(a.cfg.Auth.Keys))
 	for _, k := range a.cfg.Auth.ActiveKeys() {
 		keys = append(keys, auth.Key{ID: k.ID, Secret: []byte(k.Secret)})
@@ -171,6 +198,18 @@ func (a *App) partnerAPI() (http.Handler, error) {
 		return nil, err
 	}
 
+	timeout := a.cfg.Database.QueryTimeout
+	customers, err := repository.NewCustomers(ctx, a.replica, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("customers repository: %w", err)
+	}
+	a.repositories = append(a.repositories, customers)
+	txs, err := repository.NewTransactions(ctx, a.replica, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("transactions repository: %w", err)
+	}
+	a.repositories = append(a.repositories, txs)
+
 	var results transactions.ResultCache
 	if c := a.cfg.Cache; c.Enabled {
 		a.cache = cache.NewMemory[transactions.Result](c.TTL, c.MaxEntries, c.SweepInterval)
@@ -178,12 +217,7 @@ func (a *App) partnerAPI() (http.Handler, error) {
 		results = instrumentedCache{inner: a.cache, metrics: a.metrics}
 	}
 
-	timeout := a.cfg.Database.QueryTimeout
-	finder := transactions.NewService(
-		repository.NewCustomers(a.replica, timeout),
-		repository.NewTransactions(a.replica, timeout),
-		results,
-	)
+	finder := transactions.NewService(customers, txs, results)
 	return handler.NewPublicRouter(handler.PublicDeps{
 		Logger:       a.logger,
 		Verifier:     verifier,
@@ -258,14 +292,9 @@ func newHTTPServer(c config.HTTPServer, logger *slog.Logger, h http.Handler) *ht
 	}
 }
 
-// Run waits for the database, serves traffic until ctx is cancelled or a
-// server fails, then shuts down gracefully. It returns nil after a clean
-// shutdown.
+// Run serves traffic until ctx is cancelled or a server fails, then shuts
+// down gracefully. It returns nil after a clean shutdown.
 func (a *App) Run(ctx context.Context) error {
-	if err := a.waitForDatabases(ctx); err != nil {
-		return errors.Join(err, a.closeDatabases())
-	}
-
 	servers := map[string]*http.Server{"internal": a.internal}
 	if a.public != nil {
 		servers["public"] = a.public
@@ -383,10 +412,15 @@ func (a *App) shutdown() error {
 	return err
 }
 
-// closeDatabases closes the pools; sql.DB.Close waits for queries that
-// already started to finish.
+// closeDatabases closes the repositories' prepared statements, then the
+// pools; sql.DB.Close waits for queries that already started to finish.
 func (a *App) closeDatabases() error {
 	var errs []error
+	for _, r := range a.repositories {
+		if err := r.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close repository statements: %w", err))
+		}
+	}
 	if a.replica != a.primary {
 		if err := a.replica.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close replica database: %w", err))

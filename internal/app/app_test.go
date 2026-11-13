@@ -22,8 +22,12 @@ import (
 )
 
 // fakeDB stands in for MySQL: connections open instantly and pings succeed
-// until down is set, which simulates an outage.
-type fakeDB struct{ down atomic.Bool }
+// until down is set, which simulates an outage. Statements can be prepared
+// (but not executed) unless prepareFails is set.
+type fakeDB struct {
+	down         atomic.Bool
+	prepareFails atomic.Bool
+}
 
 func (f *fakeDB) Connect(context.Context) (driver.Conn, error) {
 	if f.down.Load() {
@@ -35,14 +39,30 @@ func (f *fakeDB) Driver() driver.Driver { return nil }
 
 type fakeConn struct{ db *fakeDB }
 
-func (c fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
-func (c fakeConn) Close() error                        { return nil }
-func (c fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
+func (c fakeConn) Prepare(string) (driver.Stmt, error) {
+	if c.db.prepareFails.Load() {
+		return nil, errors.New("SELECT command denied to user")
+	}
+	return fakeStmt{}, nil
+}
+func (c fakeConn) Close() error              { return nil }
+func (c fakeConn) Begin() (driver.Tx, error) { return nil, errors.New("not supported") }
 func (c fakeConn) Ping(context.Context) error {
 	if c.db.down.Load() {
 		return errors.New("connection refused")
 	}
 	return nil
+}
+
+type fakeStmt struct{}
+
+func (fakeStmt) Close() error  { return nil }
+func (fakeStmt) NumInput() int { return -1 }
+func (fakeStmt) Exec([]driver.Value) (driver.Result, error) {
+	return nil, errors.New("not supported")
+}
+func (fakeStmt) Query([]driver.Value) (driver.Rows, error) {
+	return nil, errors.New("not supported")
 }
 
 // useFakeDB routes every pool the app opens to db.
@@ -100,7 +120,7 @@ func start(t *testing.T, cfg *config.Config) (cancel context.CancelFunc, done <-
 func startWith(t *testing.T, cfg *config.Config, db *fakeDB) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	useFakeDB(t, db)
-	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
+	a, err := New(context.Background(), cfg, slog.New(slog.DiscardHandler), "test")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,7 +205,7 @@ func TestRunFailsWhenPortIsTaken(t *testing.T) {
 	defer ln.Close()
 
 	useFakeDB(t, &fakeDB{})
-	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
+	a, err := New(context.Background(), cfg, slog.New(slog.DiscardHandler), "test")
 	require.NoError(t, err)
 	err = a.Run(context.Background())
 	require.ErrorContains(t, err, "listen public server")
@@ -301,14 +321,25 @@ func TestStartupFailsWithoutDatabase(t *testing.T) {
 	db.down.Store(true)
 	useFakeDB(t, db)
 
-	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
-	require.NoError(t, err)
-	err = a.Run(context.Background())
+	_, err := New(context.Background(), cfg, slog.New(slog.DiscardHandler), "test")
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "primary database: database not reachable")
 
 	_, err = http.Get("http://" + cfg.Server.Internal.Addr + "/health")
 	assert.Error(t, err, "no listener may be opened before the database is reachable")
+}
+
+// TestStartupFailsWhenStatementsCannotBePrepared shows that a broken query or
+// a missing grant stops the start-up instead of failing the first request.
+func TestStartupFailsWhenStatementsCannotBePrepared(t *testing.T) {
+	cfg := testConfig(t, true, 0)
+	db := &fakeDB{}
+	db.prepareFails.Store(true)
+	useFakeDB(t, db)
+
+	_, err := New(context.Background(), cfg, slog.New(slog.DiscardHandler), "test")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "customers repository: prepare select customers by email")
 }
 
 func TestCacheIsAReadinessDependency(t *testing.T) {

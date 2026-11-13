@@ -12,6 +12,34 @@ import (
 	"github.com/wmiha/vyking-3p-integration-service/internal/service/contactsync"
 )
 
+// Unlike the other repositories, these statements are not prepared on the
+// pool: a named lock belongs to one database session, so they run on the
+// lease's dedicated connection, which lives for one sync cycle only and runs
+// each of them once or a few times.
+const (
+	// sqlSetLockSessionTimeout bounds how long MySQL keeps an idle lock
+	// session (and so the lock) of a leader that vanished.
+	//
+	// Parameters: seconds.
+	sqlSetLockSessionTimeout = `SET SESSION wait_timeout = ?`
+
+	// sqlGetLock takes the named lock without waiting: 1 when acquired, 0 when
+	// another session holds it.
+	//
+	// Parameters: lock name.
+	sqlGetLock = `SELECT GET_LOCK(?, 0)`
+
+	// sqlIsLockHeldBySession reports whether this session still owns the lock.
+	//
+	// Parameters: lock name.
+	sqlIsLockHeldBySession = `SELECT IS_USED_LOCK(?) = CONNECTION_ID()`
+
+	// sqlReleaseLock frees the lock.
+	//
+	// Parameters: lock name.
+	sqlReleaseLock = `DO RELEASE_LOCK(?)`
+)
+
 // ErrLockLost reports that a held named lock is gone.
 var ErrLockLost = errors.New("named lock is no longer held")
 
@@ -40,13 +68,12 @@ func (l *Locker) TryLock(ctx context.Context, name string) (contactsync.Lease, b
 		return nil, false, wrap("acquire lock connection", err)
 	}
 
-	stmt := fmt.Sprintf("SET SESSION wait_timeout = %d", int(l.sessionTimeout.Seconds()))
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+	if _, err := conn.ExecContext(ctx, sqlSetLockSessionTimeout, int64(l.sessionTimeout.Seconds())); err != nil {
 		discard(conn)
 		return nil, false, wrap("configure lock session", err)
 	}
 	var got sql.Null[int64]
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", name).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, sqlGetLock, name).Scan(&got); err != nil {
 		discard(conn)
 		return nil, false, wrap("get lock", err)
 	}
@@ -75,7 +102,7 @@ func (l *lease) Held(ctx context.Context) error {
 		return nil
 	}
 	var owner sql.Null[int64]
-	if err := l.conn.QueryRowContext(ctx, "SELECT IS_USED_LOCK(?) = CONNECTION_ID()", l.name).Scan(&owner); err != nil {
+	if err := l.conn.QueryRowContext(ctx, sqlIsLockHeldBySession, l.name).Scan(&owner); err != nil {
 		return fmt.Errorf("%w: %w", ErrLockLost, err)
 	}
 	if !owner.Valid || owner.V != 1 {
@@ -88,7 +115,7 @@ func (l *lease) Held(ctx context.Context) error {
 // Release frees the lock and discards the connection, so neither the lock
 // nor the session settings can leak into the pool.
 func (l *lease) Release(ctx context.Context) error {
-	_, err := l.conn.ExecContext(ctx, "DO RELEASE_LOCK(?)", l.name)
+	_, err := l.conn.ExecContext(ctx, sqlReleaseLock, l.name)
 	discard(l.conn)
 	if err != nil {
 		return wrap("release lock", err)
