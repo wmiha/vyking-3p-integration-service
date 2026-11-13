@@ -48,6 +48,8 @@ decision, its alternatives and its trade-offs. "Load and scalability" and "What 
 - Partners receive HS256 JWTs that we issue, listing their brands and the `transactions:read` scope.
 - An email lookup is case-insensitive but otherwise exact; emails are unique only per brand.
 - Brand API keys come from configuration and secrets; brands without a key are not synced.
+- Service logs are shipped to central storage and retained; they are the sync's audit trail, since we may not write
+  any other table.
 - Acme's lookup answers `{"id": ...}` or `404`, and PATCH accepts the full contact.
 - 55 requests per minute per brand leaves headroom under Acme's 60/min in case other clients share the key.
 
@@ -169,6 +171,13 @@ confirmed with the business before going live.
 | `cancelled` | cancelled_by_customer, cancelled_by_operator, cancelled_timeout | |
 | `pending` | any unknown status id | logged as a warning; never claims money moved or a final state we cannot verify |
 
+**Known limitation: unknown statuses and the `pending` filter.** A status id missing from the mapping (one added to
+`transaction_statuses` later) is shown as `pending` with `status_detail: unknown`, but `status=pending` filters by the
+*known* pending ids, so such a transaction is missing from a filtered answer. Including it would mean filtering by
+"everything except the known non-pending ids", which also changes the cursor fingerprint, for a case that should not
+happen in a stable mapping. Instead, every unknown id is logged as a warning and must be added to `statusMap`; new
+statuses are a change to confirm with the business anyway.
+
 Reversed and chargeback are the most debatable rows. Mapping them to `failed` or `cancelled` would contradict Acme's
 definitions ("will not complete", "stopped before completion"), because the payment *did* complete. `completed` plus
 `status_detail: reversed/chargeback` keeps the vocabulary correct and lets the support agent see what happened.
@@ -252,6 +261,19 @@ adding `SYQ_cStatus`, `SYQ_iAttempts`, `SYQ_cLastError` and `SYQ_dNextAttempt` (
 filter on it, and enables a small admin tool or service to list parked entries and let an operator retry, fix or close
 them after confirming with the people involved. A dead-letter queue would play the same role in a broker-based design.
 
+**Investigating a sync: logs are the audit trail.** We may not write anything but the two tables, so the record of
+every sync outcome is the structured log, not a database table:
+- one line per customer and attempt (`customer synced` / `customer sync failed`) with `run_id`, `brand_id`,
+  `customer_id`, `queue_ids`, `outcome`, `contact_id`, duration, queue lag, the error and the next retry time;
+- one line per cycle (`sync cycle finished`) with the counts per outcome, orphan and unconfigured entries;
+- durable timestamps of the last success in the database: `partner_contacts.PCO_dSynced` and `sync_queue.SYQ_dProcessed`;
+- metrics for trends and alerts, and `GET /internal/sync/status` for the last cycle (in memory, per replica).
+
+The logs must therefore be shipped to central log storage (Loki, ELK, CloudWatch) with a retention that matches how
+far back support or audits need to look. Searching by `customer_id` or `run_id` then answers "what happened to this
+customer?" across replicas and restarts. With a service-owned table (see "What remains") the same lines could also be
+written as rows.
+
 **Failure catalogue (as implemented).**
 
 | Failure | Handling | What remains |
@@ -276,6 +298,12 @@ them after confirming with the people involved. A dead-letter queue would play t
 **Throughput.** 55 requests/minute per brand (kept below 60 so other clients can share the key) means roughly 50
 contacts per minute per brand. An initial backfill of 100k customers would take about 33 hours. Question: does Acme
 offer a bulk import for the first load?
+
+**Sizing the workers.** The budget is only reachable with enough concurrent calls: workers needed ≈ request rate ×
+answer time (Little's law). The default `workers_per_brand: 4` saturates 55/min while Acme answers within about 4s.
+If Acme really answers in its documented worst case of 30s, 4 workers make only about 8 calls per minute and the
+backlog drains about 7 times slower; ~28 workers would be needed. Each worker is a goroutine waiting on HTTP, so
+raising it is cheap. The Acme latency metric (`vyking_acme_request_duration_seconds`) shows when to tune it.
 
 **Questions for Acme Support.**
 - Can a `409` return the existing contact id, or can contacts be looked up by `external_id`? Today a contact created
@@ -494,4 +522,7 @@ well.
 - OpenTelemetry tracing across the API, the database and Acme calls (request ids already propagate as `X-Request-ID`).
 - Kubernetes manifests (Deployment, PodDisruptionBudget, ClusterIP service for the internal port, NetworkPolicy), and
   config delivered as ConfigMap plus Secret.
+- Defense in depth for the internal port. Today only network isolation keeps `/internal/sync/run` and `/metrics`
+  private. A NetworkPolicy that admits only Prometheus and the kubelet probes would enforce it, and a shared secret
+  (or mTLS) on the sync trigger would protect it if a policy were ever misconfigured.
 - Contract tests against Acme's real sandbox once available; today the mock encodes our reading of the contract.
