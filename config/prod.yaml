@@ -131,7 +131,7 @@ sync:
   workers_per_brand: 4
   job_timeout: 2m
   lock_name: vyking-3p-contact-sync
-  lock_session_timeout: 120s
+  lock_session_timeout: 300s # must exceed job_timeout + lock_check_interval
   lock_check_interval: 5s
   backoff_initial: 1m
   backoff_max: 1h

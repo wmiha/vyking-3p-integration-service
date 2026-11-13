@@ -525,8 +525,12 @@ func (s *Sync) validate() []error {
 	if s.LockName == "" {
 		errs = append(errs, errors.New("sync.lock_name is required"))
 	}
-	if s.LockSessionTimeout <= s.LockCheckInterval {
-		errs = append(errs, errors.New("sync.lock_session_timeout must exceed sync.lock_check_interval"))
+	// The lock's session is idle while every worker is inside a job, for up to
+	// job_timeout plus the check throttle. If wait_timeout ran out first,
+	// MySQL would drop the session and free the lock while this leader is
+	// still syncing, letting a second replica start.
+	if s.LockSessionTimeout <= s.JobTimeout+s.LockCheckInterval {
+		errs = append(errs, errors.New("sync.lock_session_timeout must exceed sync.job_timeout + sync.lock_check_interval"))
 	}
 	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 	return errs

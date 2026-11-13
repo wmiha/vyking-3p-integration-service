@@ -443,7 +443,7 @@ sync:
   workers_per_brand: 4
   job_timeout: 2m
   lock_name: sync
-  lock_session_timeout: 120s
+  lock_session_timeout: 300s
   lock_check_interval: 5s
   backoff_initial: 1m
   backoff_max: 1h
@@ -467,7 +467,11 @@ func TestSyncConfig(t *testing.T) {
 		{name: "backoff max below initial", replace: [2]string{"backoff_max: 1h", "backoff_max: 1s"},
 			wantErr: "sync.backoff_max must be >= sync.backoff_initial"},
 		{name: "lock check slower than session timeout", replace: [2]string{"lock_check_interval: 5s", "lock_check_interval: 5m"},
-			wantErr: "sync.lock_session_timeout must exceed sync.lock_check_interval"},
+			wantErr: "sync.lock_session_timeout must exceed sync.job_timeout + sync.lock_check_interval"},
+		{name: "lock session shorter than a job", replace: [2]string{"lock_session_timeout: 300s", "lock_session_timeout: 120s"},
+			wantErr: "sync.lock_session_timeout must exceed sync.job_timeout + sync.lock_check_interval"},
+		{name: "lock session just outlives a job", replace: [2]string{"lock_session_timeout: 300s", "lock_session_timeout: 126s"},
+			wantBrands: []uint32{1}},
 		{name: "no workers", replace: [2]string{"workers_per_brand: 4", "workers_per_brand: 0"},
 			wantErr: "sync.batch_per_brand and sync.workers_per_brand must be at least 1"},
 	}

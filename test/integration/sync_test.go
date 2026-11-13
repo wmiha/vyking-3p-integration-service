@@ -89,7 +89,7 @@ func syncConfig(t *testing.T) *config.Config {
 	}
 	cfg.Sync = config.Sync{
 		Enabled: true, Interval: time.Hour, BatchPerBrand: 50, WorkersPerBrand: 4, JobTimeout: 30 * time.Second,
-		LockName: "it-contact-sync", LockSessionTimeout: 30 * time.Second, LockCheckInterval: time.Second,
+		LockName: "it-contact-sync", LockSessionTimeout: time.Minute, LockCheckInterval: time.Second,
 		BackoffInitial: time.Hour, BackoffMax: 2 * time.Hour,
 	}
 	return cfg

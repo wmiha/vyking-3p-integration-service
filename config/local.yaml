@@ -130,7 +130,7 @@ sync:
   workers_per_brand: 4       # concurrent customers per brand; Acme may take 30s per call
   job_timeout: 2m            # one customer including retries
   lock_name: vyking-3p-contact-sync # MySQL named lock: one syncing replica at a time
-  lock_session_timeout: 120s # a vanished leader's lock is freed after this long
+  lock_session_timeout: 300s # a vanished leader's lock is freed after this long; must exceed job_timeout + lock_check_interval
   lock_check_interval: 5s    # how often the leader re-checks it still holds the lock
   backoff_initial: 1m        # retry delay for customers Acme rejected; doubles per failure
   backoff_max: 1h
