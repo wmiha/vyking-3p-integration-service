@@ -28,6 +28,10 @@ type InternalDeps struct {
 	Profiler *Credentials
 	// Sync exposes the contact sync trigger and status; nil when disabled.
 	Sync SyncControl
+	// Metrics serves /metrics; nil disables it.
+	Metrics http.Handler
+	// Requests records served requests; nil disables it.
+	Requests RequestObserver
 }
 
 // Credentials for HTTP Basic authentication.
@@ -46,11 +50,14 @@ func NewInternalRouter(d InternalDeps) http.Handler {
 		rt.handle(http.MethodPost, "/internal/sync/run", triggerSync(d.Sync))
 		rt.handle(http.MethodGet, "/internal/sync/status", syncStatus(d.Sync))
 	}
+	if d.Metrics != nil {
+		rt.handle(http.MethodGet, "/metrics", d.Metrics)
+	}
 	if d.Profiler != nil {
 		registerPprof(rt)
 		rt.guard("/debug/pprof", BasicAuth("pprof", d.Profiler.Username, d.Profiler.Password))
 	}
-	return rt.build(d.Logger, "/health", "/ready")
+	return rt.build(d.Logger, "internal", d.Requests, "/health", "/ready", "/metrics")
 }
 
 // PublicDeps are the collaborators of the public (partner-facing) router.
@@ -59,16 +66,19 @@ type PublicDeps struct {
 	Verifier     TokenVerifier
 	Transactions TransactionFinder
 	Limits       PageLimits
+	// Requests and Partner record metrics; nil disables them.
+	Requests RequestObserver
+	Partner  PartnerObserver
 }
 
 // NewPublicRouter serves the partner API. Every route requires a bearer
 // token; the request id and access log apply to rejected requests too.
 func NewPublicRouter(d PublicDeps) http.Handler {
 	rt := newRouter()
-	authenticated := Authenticate(d.Verifier, domain.ScopeTransactionsRead, d.Logger)
+	authenticated := Authenticate(d.Verifier, domain.ScopeTransactionsRead, d.Logger, d.Partner)
 	rt.handle(http.MethodGet, "/v1/transactions",
-		authenticated(listTransactions(d.Transactions, d.Limits, d.Logger)))
-	return rt.build(d.Logger)
+		authenticated(listTransactions(d.Transactions, d.Limits, d.Logger, d.Partner)))
+	return rt.build(d.Logger, "public", d.Requests)
 }
 
 // router wraps http.ServeMux so that unknown paths and unsupported methods
@@ -123,12 +133,13 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	apierror.Write(w, r, apierror.New(http.StatusNotFound, apierror.CodeNotFound, "resource not found"))
 }
 
-// build wraps the router with the standard middleware chain. quietPaths are
-// access-logged at debug level.
-func (rt *router) build(logger *slog.Logger, quietPaths ...string) http.Handler {
+// build wraps the router with the standard middleware chain. server labels
+// the request metrics; quietPaths are access-logged at debug level.
+func (rt *router) build(logger *slog.Logger, server string, requests RequestObserver, quietPaths ...string) http.Handler {
 	mws := []Middleware{
 		RequestID(),
 		AccessLog(logger, quietPaths...),
+		Instrument(server, requests),
 		Recover(logger),
 	}
 	return Chain(rt, append(mws, rt.guards...)...)

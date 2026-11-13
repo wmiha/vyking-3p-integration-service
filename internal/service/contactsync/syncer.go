@@ -66,6 +66,7 @@ type Syncer struct {
 	writer    ContactWriter
 	finder    ContactFinder
 	logger    *slog.Logger
+	observer  Observer
 
 	backoff *backoff
 	trigger chan struct{}
@@ -81,12 +82,18 @@ type Deps struct {
 	Writer    ContactWriter
 	Finder    ContactFinder
 	Logger    *slog.Logger
+	// Observer receives monitoring events; nil disables them.
+	Observer Observer
 }
 
 func New(cfg Config, d Deps) *Syncer {
+	observer := d.Observer
+	if observer == nil {
+		observer = nopObserver{}
+	}
 	return &Syncer{
 		cfg: cfg, queue: d.Queue, customers: d.Customers, recorder: d.Recorder, lock: d.Lock,
-		writer: d.Writer, finder: d.Finder, logger: d.Logger,
+		writer: d.Writer, finder: d.Finder, logger: d.Logger, observer: observer,
 		backoff: newBackoff(cfg.BackoffInitial, cfg.BackoffMax),
 		trigger: make(chan struct{}, 1),
 	}
@@ -119,11 +126,14 @@ type RunSummary struct {
 	Outcomes   map[string]int `json:"outcomes"`
 	// Orphans are entries of missing customers; Unconfigured are entries of
 	// brands without credentials. Both stay outstanding.
-	Orphans      int    `json:"orphan_entries"`
-	Unconfigured int    `json:"unconfigured_brand_entries"`
-	BackingOff   int    `json:"customers_backing_off"`
-	BatchFull    bool   `json:"batch_full"`
-	Error        string `json:"error,omitempty"`
+	Orphans      int  `json:"orphan_entries"`
+	Unconfigured int  `json:"unconfigured_brand_entries"`
+	BackingOff   int  `json:"customers_backing_off"`
+	BatchFull    bool `json:"batch_full"`
+	// OldestQueued is the oldest fetched entry per brand (0 = missing
+	// customers); it shows how far behind the sync is.
+	OldestQueued map[domain.BrandID]time.Time `json:"oldest_queued_at,omitempty"`
+	Error        string                       `json:"error,omitempty"`
 }
 
 // Synced counts customers whose contact was confirmed this cycle.
@@ -188,6 +198,7 @@ func (s *Syncer) RunOnce(ctx context.Context) (summary RunSummary) {
 		summary.FinishedAt = time.Now().UTC()
 		summary.BackingOff = s.backoff.size(time.Now())
 		s.lastRun.Store(&summary)
+		s.observer.CycleCompleted(summary)
 		s.logSummary(ctx, summary)
 	}()
 
@@ -248,11 +259,15 @@ type job struct {
 // queue order. Orphans and unconfigured brands are reported and skipped.
 func (s *Syncer) plan(ctx context.Context, entries []domain.QueueEntry, summary *RunSummary) (map[domain.BrandID][]*job, map[domain.BrandID]int) {
 	jobs := map[domain.BrandID][]*job{}
+	summary.OldestQueued = map[domain.BrandID]time.Time{}
 	byCustomer := map[domain.CustomerID]*job{}
 	perBrand := map[domain.BrandID]int{}
 
 	for _, e := range entries {
 		perBrand[e.Brand]++
+		if oldest, ok := summary.OldestQueued[e.Brand]; !ok || e.QueuedAt.Before(oldest) {
+			summary.OldestQueued[e.Brand] = e.QueuedAt
+		}
 		switch {
 		case e.Brand == 0:
 			summary.Orphans++
@@ -305,6 +320,7 @@ func (s *Syncer) syncBrand(ctx context.Context, lease Lease, brand domain.BrandI
 				if brandCtx.Err() != nil {
 					mu.Lock()
 					outcomes[OutcomeNotStarted]++
+					s.observer.CustomerSynced(brand, OutcomeNotStarted)
 					mu.Unlock()
 					continue
 				}
@@ -313,6 +329,7 @@ func (s *Syncer) syncBrand(ctx context.Context, lease Lease, brand domain.BrandI
 					stopBrand()
 					mu.Lock()
 					outcomes[OutcomeNotStarted]++
+					s.observer.CustomerSynced(brand, OutcomeNotStarted)
 					mu.Unlock()
 					continue
 				}
@@ -324,6 +341,7 @@ func (s *Syncer) syncBrand(ctx context.Context, lease Lease, brand domain.BrandI
 				}
 				mu.Lock()
 				outcomes[outcome]++
+				s.observer.CustomerSynced(brand, outcome)
 				mu.Unlock()
 			}
 		})

@@ -42,7 +42,8 @@ const (
 //	&limit=20                   optional page size
 //	&brand_id=1                 optional, disambiguates emails present in several brands
 //	&cursor=...                 optional, from page.next_cursor of the previous page
-func listTransactions(finder TransactionFinder, limits PageLimits, logger *slog.Logger) http.Handler {
+func listTransactions(finder TransactionFinder, limits PageLimits, logger *slog.Logger, obs PartnerObserver) http.Handler {
+	obs = partnerObserver(obs)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		principal, ok := principalFrom(ctx)
@@ -53,6 +54,7 @@ func listTransactions(finder TransactionFinder, limits PageLimits, logger *slog.
 
 		q, apiErr := parseTransactionsQuery(r.URL.Query(), limits)
 		if apiErr != nil {
+			obs.PartnerLookup(string(apiErr.Code))
 			apierror.Write(w, r, apiErr)
 			return
 		}
@@ -64,6 +66,11 @@ func listTransactions(finder TransactionFinder, limits PageLimits, logger *slog.
 				return // the client went away; nobody is left to answer
 			}
 			apiErr := domainError(err)
+			if e, ok := errors.AsType[*apierror.Error](apiErr); ok {
+				obs.PartnerLookup(string(e.Code))
+			} else {
+				obs.PartnerLookup(string(apierror.CodeInternal))
+			}
 			if e, ok := errors.AsType[*apierror.Error](apiErr); ok && e.Status < http.StatusInternalServerError {
 				logger.InfoContext(ctx, "partner lookup rejected", "code", e.Code, "brand_id", uint32(q.Brand))
 			}
@@ -71,6 +78,7 @@ func listTransactions(finder TransactionFinder, limits PageLimits, logger *slog.
 			return
 		}
 
+		obs.PartnerLookup("ok")
 		// Audit trail: which partner looked at which customer's data.
 		logger.InfoContext(ctx, "partner lookup", "customer_id", uint32(res.Customer.ID),
 			"brand_id", uint32(res.Customer.Brand), "returned", len(res.Transactions),

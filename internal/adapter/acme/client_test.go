@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -304,4 +305,45 @@ func TestRetryAfterParsing(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+type recordingObserver struct {
+	mu       sync.Mutex
+	requests []string
+	events   []string
+}
+
+func (o *recordingObserver) RequestDone(brand domain.BrandID, op string, status int, _ time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.requests = append(o.requests, fmt.Sprintf("%d %s %d", brand, op, status))
+}
+
+func (o *recordingObserver) Event(brand domain.BrandID, event string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.events = append(o.events, fmt.Sprintf("%d %s", brand, event))
+}
+
+func TestObserver(t *testing.T) {
+	srv := &scripted{responses: []response{
+		{status: 429, header: map[string]string{"Retry-After": "0"}},
+		{status: 503},
+		{status: 201, body: `{"id":"c-1"}`},
+		{status: 401},
+	}}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	obs := &recordingObserver{}
+	c := New(Config{BaseURL: ts.URL, RequestTimeout: time.Second, MaxAttempts: 3, BaseBackoff: time.Millisecond,
+		MaxBackoff: time.Millisecond, RatePerMinute: 60_000, Burst: 100, BreakerThreshold: 5, AuthCooldown: time.Hour,
+		APIKeys: map[domain.BrandID]string{1: "k"}, Observer: obs}, nil, slog.New(slog.DiscardHandler))
+
+	_, err := c.Create(context.Background(), 1, jane)
+	require.NoError(t, err)
+	_, err = c.Create(context.Background(), 1, jane)
+	require.ErrorIs(t, err, contactsync.ErrPartnerUnauthorized)
+
+	assert.Equal(t, []string{"1 create 429", "1 create 503", "1 create 201", "1 create 401"}, obs.requests)
+	assert.Equal(t, []string{"1 rate_limited", "1 key_refused"}, obs.events)
 }

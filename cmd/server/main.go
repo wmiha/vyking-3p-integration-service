@@ -52,7 +52,7 @@ func run(args []string) int {
 	// handler, format and service attributes.
 	slog.SetDefault(logger)
 
-	a, err := app.New(cfg, logger)
+	a, err := app.New(cfg, logger, version)
 	if err != nil {
 		logger.Error("start-up failed", "error", err)
 		return 1

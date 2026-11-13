@@ -67,7 +67,7 @@ func TestAuthenticate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var got domain.Principal
-			h := Authenticate(verifier, domain.ScopeTransactionsRead, discardLogger())(
+			h := Authenticate(verifier, domain.ScopeTransactionsRead, discardLogger(), nil)(
 				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					p, ok := principalFrom(r.Context())
 					require.True(t, ok)

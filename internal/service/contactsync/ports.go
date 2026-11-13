@@ -70,3 +70,15 @@ var (
 	// circuit; worth retrying later.
 	ErrPartnerUnavailable = errors.New("partner unavailable")
 )
+
+// Observer receives sync events for monitoring. Implementations must be safe
+// for concurrent use and must not block.
+type Observer interface {
+	CustomerSynced(brand domain.BrandID, outcome string)
+	CycleCompleted(summary RunSummary)
+}
+
+type nopObserver struct{}
+
+func (nopObserver) CustomerSynced(domain.BrandID, string) {}
+func (nopObserver) CycleCompleted(RunSummary)             {}

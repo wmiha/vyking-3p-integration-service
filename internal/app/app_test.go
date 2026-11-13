@@ -100,7 +100,7 @@ func start(t *testing.T, cfg *config.Config) (cancel context.CancelFunc, done <-
 func startWith(t *testing.T, cfg *config.Config, db *fakeDB) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	useFakeDB(t, db)
-	a, err := New(cfg, slog.New(slog.DiscardHandler))
+	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -185,7 +185,7 @@ func TestRunFailsWhenPortIsTaken(t *testing.T) {
 	defer ln.Close()
 
 	useFakeDB(t, &fakeDB{})
-	a, err := New(cfg, slog.New(slog.DiscardHandler))
+	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
 	require.NoError(t, err)
 	err = a.Run(context.Background())
 	require.ErrorContains(t, err, "listen public server")
@@ -301,7 +301,7 @@ func TestStartupFailsWithoutDatabase(t *testing.T) {
 	db.down.Store(true)
 	useFakeDB(t, db)
 
-	a, err := New(cfg, slog.New(slog.DiscardHandler))
+	a, err := New(cfg, slog.New(slog.DiscardHandler), "test")
 	require.NoError(t, err)
 	err = a.Run(context.Background())
 	require.Error(t, err)

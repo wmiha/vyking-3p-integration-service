@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -377,4 +379,43 @@ func TestBackoffGrowsAndCaps(t *testing.T) {
 	assert.Empty(t, b.excluded(now.Add(11*time.Minute)), "eligible again after the delay")
 	b.clear(7)
 	assert.Zero(t, b.size(now))
+}
+
+type recordingObserver struct {
+	mu       sync.Mutex
+	outcomes map[string]int
+	cycles   []RunSummary
+}
+
+func (o *recordingObserver) CustomerSynced(brand domain.BrandID, outcome string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.outcomes[fmt.Sprint(brand, ":", outcome)]++
+}
+
+func (o *recordingObserver) CycleCompleted(s RunSummary) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.cycles = append(o.cycles, s)
+}
+
+func TestObserverSeesOutcomesAndCycles(t *testing.T) {
+	f := newFixture()
+	f.cfg.WorkersPerBrand = 1
+	f.store.addCustomer(1, 1, "a@example.com")
+	f.store.addCustomer(2, 1, "b@example.com")
+	f.store.addCustomer(3, 2, "c@example.com")
+	f.store.queue(1, 2, 3)
+	f.acme.failNext["2"] = fmt.Errorf("%w: 503", ErrPartnerUnavailable)
+	obs := &recordingObserver{outcomes: map[string]int{}}
+
+	s := New(f.cfg, Deps{Queue: f.store, Customers: f.store, Recorder: f.store, Lock: f.lock,
+		Writer: f.acme, Finder: f.acme, Logger: slog.New(slog.DiscardHandler), Observer: obs})
+	r := s.RunOnce(context.Background())
+
+	assert.Equal(t, map[string]int{"1:created": 1, "1:partner_unavailable": 1, "2:created": 1}, obs.outcomes)
+	require.Len(t, obs.cycles, 1)
+	assert.Equal(t, r.RunID, obs.cycles[0].RunID)
+	assert.Len(t, obs.cycles[0].OldestQueued, 2, "oldest entry tracked per brand")
+	assert.False(t, obs.cycles[0].FinishedAt.IsZero(), "observer sees the completed summary")
 }

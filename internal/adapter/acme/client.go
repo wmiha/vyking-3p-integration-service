@@ -55,7 +55,21 @@ type Config struct {
 
 	// APIKeys holds each brand's API key. Brands without a key cannot sync.
 	APIKeys map[domain.BrandID]string
+	// Observer receives monitoring events; nil disables them.
+	Observer Observer
 }
+
+// Observer receives request outcomes and client events (rate_limited,
+// circuit_opened, key_refused) for monitoring. Status 0 means no response.
+type Observer interface {
+	RequestDone(brand domain.BrandID, op string, status int, d time.Duration)
+	Event(brand domain.BrandID, event string)
+}
+
+type nopObserver struct{}
+
+func (nopObserver) RequestDone(domain.BrandID, string, int, time.Duration) {}
+func (nopObserver) Event(domain.BrandID, string)                           {}
 
 // maxThrottledRetries bounds how often one call waits for Retry-After.
 const maxThrottledRetries = 10
@@ -80,6 +94,9 @@ type brandState struct {
 // New returns a client. httpClient may be nil for a default one; its own
 // timeout is not used, every attempt is bounded by cfg.RequestTimeout.
 func New(cfg Config, httpClient *http.Client, logger *slog.Logger) *Client {
+	if cfg.Observer == nil {
+		cfg.Observer = nopObserver{}
+	}
 	if httpClient == nil {
 		httpClient = &http.Client{Transport: &http.Transport{
 			Proxy:               http.ProxyFromEnvironment,
@@ -179,6 +196,7 @@ func (c *Client) call(ctx context.Context, brand domain.BrandID, op, method, pat
 		}
 
 		res := c.attempt(ctx, state, method, path, payload)
+		c.cfg.Observer.RequestDone(brand, op, res.status, res.duration)
 		c.logger.DebugContext(ctx, "acme request", "brand_id", brand, "op", op, "status", res.status,
 			"attempt", attempt, "duration_ms", res.duration.Milliseconds(), "acme_request_id", res.requestID)
 
@@ -194,12 +212,14 @@ func (c *Client) call(ctx context.Context, brand domain.BrandID, op, method, pat
 			// Not counted as an attempt: the server asked us to wait, which
 			// the limiter now enforces for every worker of this brand.
 			state.limiter.PauseUntil(time.Now().Add(res.retryAfter))
+			c.cfg.Observer.Event(brand, "rate_limited")
 			c.logger.WarnContext(ctx, "acme rate limit hit, pausing brand",
 				"brand_id", brand, "op", op, "retry_after", res.retryAfter.String())
 			continue
 
 		case errors.Is(res.err, contactsync.ErrPartnerUnauthorized):
 			state.trip(c.cfg.AuthCooldown)
+			c.cfg.Observer.Event(brand, "key_refused")
 			c.logger.ErrorContext(ctx, "acme refused the brand's API key, pausing brand",
 				"brand_id", brand, "op", op, "status", res.status, "cooldown", c.cfg.AuthCooldown.String())
 			return "", fmt.Errorf("%s: %w", op, res.err)
@@ -226,6 +246,7 @@ func (c *Client) call(ctx context.Context, brand domain.BrandID, op, method, pat
 	}
 
 	if state.failed(c.cfg.BreakerThreshold, c.cfg.BreakerCooldown) {
+		c.cfg.Observer.Event(brand, "circuit_opened")
 		c.logger.ErrorContext(ctx, "acme unavailable, circuit opened", "brand_id", brand,
 			"cooldown", c.cfg.BreakerCooldown.String())
 	}

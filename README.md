@@ -119,6 +119,27 @@ curl -s localhost:8081/_debug/contacts | jq          # what the Acme mock receiv
 
 Rate limit, retry, backoff and concurrency settings are in the `acme` and `sync` sections of `config/*.yaml`.
 
+## Observability
+
+- **Logs:** JSON (`LOG_FORMAT=json`) with `request_id` on every request line and `run_id` / `brand_id` / `customer_id`
+  on sync lines. Emails are masked and query strings are never logged.
+- **Metrics:** Prometheus format at `GET :9090/metrics` (internal port only).
+- **Dashboard:** `make obs-up` adds Prometheus (`localhost:9091`) and Grafana (`localhost:3000`, anonymous viewer) with
+  a provisioned *Vyking 3P integration* dashboard.
+
+| Metric | Labels | Use |
+|--------|--------|-----|
+| `vyking_http_requests_total`, `vyking_http_request_duration_seconds` | `server`, `route`, `code` | traffic, errors, latency per route pattern |
+| `vyking_partner_lookups_total` | `outcome` | `ok` or the error code (`customer_not_found`, `customer_ambiguous`, ...) |
+| `vyking_auth_failures_total` | `code` | rejected tokens (`token_expired`, `token_invalid`, ...) |
+| `vyking_cache_requests_total` | `result` | cache hit ratio |
+| `vyking_acme_requests_total`, `vyking_acme_request_duration_seconds` | `brand`, `op`, `status` | Acme Support answers and latency |
+| `vyking_acme_events_total` | `brand`, `event` | `rate_limited`, `circuit_opened`, `key_refused` |
+| `vyking_sync_customers_total` | `brand`, `outcome` | `created`, `updated`, `recovered`, `rejected`, `partner_unavailable`, ... |
+| `vyking_sync_oldest_outstanding_age_seconds` | `brand` | how far behind the sync is (alert when it keeps growing) |
+| `vyking_sync_cycles_total`, `vyking_sync_cycle_duration_seconds`, `vyking_sync_customers_backing_off`, `vyking_sync_orphan_entries`, `vyking_sync_unconfigured_entries` | | sync health |
+| `go_sql_*` | `db_name` | connection pool usage per pool (primary, replica) |
+
 ## Partner authentication
 
 The partner API expects `Authorization: Bearer <token>`, where the token is an HS256 JWT issued by us that lists the brands

@@ -163,7 +163,7 @@ them after confirming with the people involved. A dead-letter queue would play t
 | 429 | the brand's token bucket pauses until `Retry-After` (seconds or HTTP date; 60s default), then resumes at the steady rate | none |
 | 401/403 (key revoked or rotated) | the brand pauses for `auth_cooldown`, error log | needs a person |
 | 422 / other 4xx | the customer backs off; the entry stays | until the data changes or someone acts |
-| 409 and the email lookup finds nothing | as 422 (`conflict_unresolved`) | needs Acme support (see questions) |
+| 409 and the email lookup finds nothing | as 422 (`conflict_unresolved`) | needs Acme support (see questions). Observed in the crash test: a customer **without email** created right before a SIGKILL cannot be resolved (1 of about 150); customers with an email recovered (7 of 7) |
 | 404 on update (contact deleted in Acme) | created again; the new id is stored | none |
 | 2xx without an id | treated as unavailable; the retry resolves it through 409 | none |
 | DB write fails after Acme succeeded | the transaction rolls back (no half state); the next attempt recovers through 409 | extra calls |
@@ -256,6 +256,30 @@ payload: {"iss": "vyking-integration", "aud": "vyking-partner-api", "sub": "acme
 
 **Questions.** How can Acme Support send credentials (static header only, or OAuth)? One token per brand or one token
 covering several brands? Acceptable lifetime and rotation process? Should inbound requests be rate-limited per partner?
+
+### Observability
+
+- **Business metrics, not just HTTP.** Besides request rate, latency and errors per route, we count:
+  - partner lookups by outcome and rejected tokens by code;
+  - cache hits;
+  - Acme answers, latency and client events (throttled, circuit opened, key refused) per brand;
+  - sync outcomes per brand and customer.
+
+  The single most useful sync signal is the **age of the oldest outstanding entry per brand**: if it keeps growing the
+  backlog is not draining, whatever the cause.
+- **Prometheus stays in one package.** Services and adapters report through small observer interfaces (nop by
+  default); only `internal/platform/metrics` imports Prometheus, on a private registry.
+- **Bounded cardinality.** Labels are route patterns (an unmatched path becomes `unmatched`, never the raw URL),
+  configured brand ids and fixed outcome or code vocabularies. No emails, customer ids or tokens appear in labels.
+- **Multiple replicas.** Only the leader describes the queue. A replica that loses leadership clears its queue gauges,
+  so dashboards (`max by (brand)`) do not show stale ages from an earlier leader.
+- **Alerts we would start with:**
+  - oldest outstanding age above 30 minutes for a brand;
+  - any `key_refused` event;
+  - `circuit_opened` repeatedly within 15 minutes;
+  - partner API 5xx ratio above 1%;
+  - p95 latency above 500 ms;
+  - `/ready` failing on every pod.
 
 ### Error model
 

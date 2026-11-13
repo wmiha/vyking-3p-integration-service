@@ -74,10 +74,10 @@ deps-up: ## Start MySQL (+ migrations) and the Acme mock for `make run` on the h
 	$(COMPOSE) run --rm flyway migrate
 
 down: ## Stop the stack, keep the data volume
-	$(COMPOSE) down --remove-orphans
+	$(COMPOSE) --profile observability down --remove-orphans
 
 clean: ## Stop the stack, delete the data volume (fresh start) and build artifacts
-	$(COMPOSE) down -v --remove-orphans
+	$(COMPOSE) --profile observability down -v --remove-orphans
 	rm -rf $(BIN_DIR) coverage.out
 
 logs: ## Follow service logs
@@ -100,3 +100,11 @@ seed: ## Load deterministic sample data into the compose database (replaces exis
 .PHONY: tokens
 tokens: ## Print partner test tokens (valid, expired, forged, ...) as TOKEN_*=... lines
 	@$(GO) run ./scripts/tokengen -matrix
+
+##@ Observability
+.PHONY: obs-up obs-down
+obs-up: ## Start the stack plus Prometheus (localhost:9091) and Grafana (localhost:3000)
+	VERSION=$(VERSION) $(COMPOSE) --profile observability up -d --build --wait app acmemock prometheus grafana
+
+obs-down: ## Stop Prometheus and Grafana
+	$(COMPOSE) --profile observability stop prometheus grafana

@@ -1,0 +1,132 @@
+{
+  "uid": "vyking-3p",
+  "title": "Vyking 3P integration",
+  "tags": ["vyking"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": {"from": "now-30m", "to": "now"},
+  "panels": [
+    {
+      "id": 1, "type": "row", "title": "Partner API", "collapsed": false,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Requests per second by status code",
+      "gridPos": {"x": 0, "y": 1, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "{{code}}",
+        "expr": "sum by (code) (rate(vyking_http_requests_total{server=\"public\"}[1m]))"}]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Latency p50 / p95 / p99",
+      "gridPos": {"x": 8, "y": 1, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "p50",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(vyking_http_request_duration_seconds_bucket{server=\"public\"}[5m])))"},
+        {"refId": "B", "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vyking_http_request_duration_seconds_bucket{server=\"public\"}[5m])))"},
+        {"refId": "C", "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vyking_http_request_duration_seconds_bucket{server=\"public\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Partner lookups by outcome (per minute)",
+      "gridPos": {"x": 16, "y": 1, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "{{outcome}}",
+        "expr": "sum by (outcome) (rate(vyking_partner_lookups_total[5m])) * 60"}]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Authentication failures by code (per minute)",
+      "gridPos": {"x": 0, "y": 9, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "{{code}}",
+        "expr": "sum by (code) (rate(vyking_auth_failures_total[5m])) * 60"}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Cache hit ratio (5m)",
+      "gridPos": {"x": 12, "y": 9, "w": 6, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "targets": [{"refId": "A",
+        "expr": "sum(rate(vyking_cache_requests_total{result=\"hit\"}[5m])) / clamp_min(sum(rate(vyking_cache_requests_total[5m])), 1e-9)"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "DB connections in use",
+      "gridPos": {"x": 18, "y": 9, "w": 6, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "{{db_name}}", "expr": "go_sql_in_use_connections"}]
+    },
+    {
+      "id": 8, "type": "row", "title": "Contact sync", "collapsed": false,
+      "gridPos": {"x": 0, "y": 16, "w": 24, "h": 1}
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Customers synced by outcome (per minute)",
+      "gridPos": {"x": 0, "y": 17, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "brand {{brand}} {{outcome}}",
+        "expr": "sum by (brand, outcome) (rate(vyking_sync_customers_total[5m])) * 60"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Oldest outstanding queue entry (age)",
+      "description": "Alert when this keeps growing: the backlog is not draining.",
+      "gridPos": {"x": 12, "y": 17, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "legendFormat": "brand {{brand}}",
+        "expr": "max by (brand) (vyking_sync_oldest_outstanding_age_seconds)"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Acme Support answers by status (per minute)",
+      "gridPos": {"x": 0, "y": 25, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "brand {{brand}} {{op}} {{status}}",
+        "expr": "sum by (brand, op, status) (rate(vyking_acme_requests_total[5m])) * 60"}]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Acme Support latency p95",
+      "gridPos": {"x": 8, "y": 25, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [{"refId": "A", "legendFormat": "brand {{brand}} {{op}}",
+        "expr": "histogram_quantile(0.95, sum by (le, brand, op) (rate(vyking_acme_request_duration_seconds_bucket[5m])))"}]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Throttling, circuit breaker and refused keys",
+      "gridPos": {"x": 16, "y": 25, "w": 8, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "legendFormat": "brand {{brand}} {{event}}",
+        "expr": "sum by (brand, event) (increase(vyking_acme_events_total[5m]))"}]
+    },
+    {
+      "id": 14, "type": "stat", "title": "Customers backing off",
+      "gridPos": {"x": 0, "y": 33, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "max(vyking_sync_customers_backing_off)"}]
+    },
+    {
+      "id": 15, "type": "stat", "title": "Entries kept (orphans / unconfigured brands)",
+      "gridPos": {"x": 6, "y": 33, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "legendFormat": "orphans", "expr": "max(vyking_sync_orphan_entries)"},
+        {"refId": "B", "legendFormat": "unconfigured", "expr": "max(vyking_sync_unconfigured_entries)"}
+      ]
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "Sync cycles (per minute) and duration p95",
+      "gridPos": {"x": 12, "y": 33, "w": 12, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "legendFormat": "cycles leader={{leader}} {{result}}",
+          "expr": "sum by (leader, result) (rate(vyking_sync_cycles_total[5m])) * 60"},
+        {"refId": "B", "legendFormat": "duration p95 (s)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vyking_sync_cycle_duration_seconds_bucket[15m])))"}
+      ]
+    }
+  ]
+}

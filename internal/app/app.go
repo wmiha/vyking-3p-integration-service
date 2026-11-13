@@ -22,6 +22,7 @@ import (
 	"github.com/wmiha/vyking-3p-integration-service/internal/domain"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
+	"github.com/wmiha/vyking-3p-integration-service/internal/platform/metrics"
 	"github.com/wmiha/vyking-3p-integration-service/internal/service/contactsync"
 	"github.com/wmiha/vyking-3p-integration-service/internal/service/transactions"
 )
@@ -37,9 +38,10 @@ var openDB = database.Open
 
 // App is a fully wired service instance.
 type App struct {
-	cfg    *config.Config
-	logger *slog.Logger
-	health *health.Checker
+	cfg     *config.Config
+	logger  *slog.Logger
+	health  *health.Checker
+	metrics *metrics.Metrics
 
 	// primary serves writes and every sync read; replica serves partner API
 	// reads and is the primary itself when no replica is configured.
@@ -61,12 +63,13 @@ type App struct {
 }
 
 // New wires the application. It opens connection pools lazily and does not
-// open listeners; Run does both.
-func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
+// open listeners; Run does both. version labels the build_info metric.
+func New(cfg *config.Config, logger *slog.Logger, version string) (*App, error) {
 	a := &App{
-		cfg:    cfg,
-		logger: logger,
-		health: health.NewChecker(cfg.Server.ReadinessTimeout),
+		cfg:     cfg,
+		logger:  logger,
+		health:  health.NewChecker(cfg.Server.ReadinessTimeout),
+		metrics: metrics.New(version),
 	}
 	if err := database.SetDriverLogger(logger); err != nil {
 		return nil, fmt.Errorf("mysql driver logger: %w", err)
@@ -79,6 +82,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		Logger:    logger,
 		Readiness: a.health,
 		Profiler:  profiler(cfg.Pprof),
+		Metrics:   a.metrics.Handler(),
+		Requests:  a.metrics,
 	}
 	if cfg.Sync.Enabled {
 		a.syncer = a.contactSync()
@@ -122,6 +127,7 @@ func (a *App) contactSync() *contactsync.Syncer {
 		BreakerCooldown:   ac.BreakerCooldown,
 		AuthCooldown:      ac.AuthCooldown,
 		APIKeys:           keys,
+		Observer:          a.metrics,
 	}, nil, a.logger)
 
 	sc := a.cfg.Sync
@@ -144,6 +150,7 @@ func (a *App) contactSync() *contactsync.Syncer {
 		Writer:    client,
 		Finder:    client,
 		Logger:    a.logger,
+		Observer:  a.metrics,
 	})
 }
 
@@ -168,7 +175,7 @@ func (a *App) partnerAPI() (http.Handler, error) {
 	if c := a.cfg.Cache; c.Enabled {
 		a.cache = cache.NewMemory[transactions.Result](c.TTL, c.MaxEntries, c.SweepInterval)
 		a.health.Register("cache", a.cache)
-		results = a.cache
+		results = instrumentedCache{inner: a.cache, metrics: a.metrics}
 	}
 
 	timeout := a.cfg.Database.QueryTimeout
@@ -182,6 +189,8 @@ func (a *App) partnerAPI() (http.Handler, error) {
 		Verifier:     verifier,
 		Transactions: finder,
 		Limits:       handler.PageLimits{Default: a.cfg.PartnerAPI.DefaultLimit, Max: a.cfg.PartnerAPI.MaxLimit},
+		Requests:     a.metrics,
+		Partner:      a.metrics,
 	}), nil
 }
 
@@ -192,6 +201,7 @@ func (a *App) openDatabases() error {
 	}
 	a.primary, a.replica = primary, primary
 	a.health.Register("database_primary", health.PingFunc(primary.PingContext))
+	a.metrics.RegisterDB(primary, "primary")
 
 	if a.cfg.Database.Replica.Enabled {
 		replica, err := openDB(dbConfig(a.cfg.Database.Replica))
@@ -201,6 +211,7 @@ func (a *App) openDatabases() error {
 		}
 		a.replica = replica
 		a.health.Register("database_replica", health.PingFunc(replica.PingContext))
+		a.metrics.RegisterDB(replica, "replica")
 	}
 	return nil
 }
@@ -415,9 +426,24 @@ func (a *App) stopSyncer(ctx context.Context) error {
 	a.stopSync()
 	select {
 	case <-a.syncDone:
-		a.logger.Info("contact sync stopped")
-		return nil
+		return nil // the syncer logs its own stop
 	case <-ctx.Done():
 		return errors.New("contact sync did not stop before the shutdown timeout; in-flight entries stay outstanding")
 	}
+}
+
+// instrumentedCache counts hits and misses of the partner lookup cache.
+type instrumentedCache struct {
+	inner   transactions.ResultCache
+	metrics *metrics.Metrics
+}
+
+func (c instrumentedCache) Get(ctx context.Context, key string) (transactions.Result, bool) {
+	r, ok := c.inner.Get(ctx, key)
+	c.metrics.CacheResult(ok)
+	return r, ok
+}
+
+func (c instrumentedCache) Set(ctx context.Context, key string, r transactions.Result) {
+	c.inner.Set(ctx, key, r)
 }

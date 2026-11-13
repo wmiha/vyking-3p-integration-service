@@ -30,12 +30,14 @@ func principalFrom(ctx context.Context) (domain.Principal, bool) {
 // Authenticate requires a valid bearer token granting scope and stores the
 // resulting principal in the request context. Failures follow RFC 6750: 401
 // with a WWW-Authenticate challenge for missing or invalid tokens, 403 for a
-// valid token without the required scope.
-func Authenticate(v TokenVerifier, scope string, logger *slog.Logger) Middleware {
+// valid token without the required scope. obs may be nil.
+func Authenticate(v TokenVerifier, scope string, logger *slog.Logger, obs PartnerObserver) Middleware {
+	obs = partnerObserver(obs)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r)
 			if !ok {
+				obs.AuthFailed(string(apierror.CodeUnauthorized))
 				w.Header().Set("WWW-Authenticate", bearerRealm)
 				apierror.Write(w, r, apierror.New(http.StatusUnauthorized, apierror.CodeUnauthorized,
 					"a bearer token is required"))
@@ -45,6 +47,7 @@ func Authenticate(v TokenVerifier, scope string, logger *slog.Logger) Middleware
 			principal, err := v.Verify(r.Context(), token)
 			if err != nil {
 				apiErr := tokenError(err)
+				obs.AuthFailed(string(apiErr.Code))
 				// The token itself is never logged; the reason is enough to debug.
 				logger.InfoContext(r.Context(), "authentication failed", "code", apiErr.Code, "reason", err.Error())
 				w.Header().Set("WWW-Authenticate", bearerRealm+`, error="invalid_token", error_description="`+apiErr.Message+`"`)
@@ -53,6 +56,7 @@ func Authenticate(v TokenVerifier, scope string, logger *slog.Logger) Middleware
 			}
 
 			if !principal.HasScope(scope) {
+				obs.AuthFailed(string(apierror.CodeInsufficientScope))
 				logger.InfoContext(r.Context(), "insufficient scope", "subject", principal.Subject, "required", scope)
 				w.Header().Set("WWW-Authenticate", bearerRealm+`, error="insufficient_scope", scope="`+scope+`"`)
 				apierror.Write(w, r, apierror.New(http.StatusForbidden, apierror.CodeInsufficientScope,
