@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"github.com/wmiha/vyking-3p-integration-service/internal/apierror"
@@ -16,8 +17,8 @@ type Middleware func(http.Handler) http.Handler
 
 // Chain wraps h so that the first middleware is the outermost one.
 func Chain(h http.Handler, mws ...Middleware) http.Handler {
-	for i := len(mws) - 1; i >= 0; i-- {
-		h = mws[i](h)
+	for _, mw := range slices.Backward(mws) {
+		h = mw(h)
 	}
 	return h
 }
