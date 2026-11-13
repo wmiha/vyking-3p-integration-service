@@ -109,6 +109,88 @@ to carry authorization-relevant data.
 - IDs are strings (64-bit ids exceed JavaScript's safe integer range); amounts are exact decimal literals.
 - Inactive customers are still returned, since support needs their history. Question: confirm.
 
+### Contact sync
+
+**Shape.**
+- `sync_queue` behaves like a transactional outbox written by the producers of customer changes, and the sync is its
+  relay (the "polling publisher" variant).
+- It runs as a goroutine in every instance. A MySQL named lock (`GET_LOCK`) elects the single replica that syncs in a
+  given cycle, because Acme's rate limit is **per API key**: several replicas syncing at once would share each brand's
+  60 requests/minute without knowing it.
+- One query fetches the oldest `batch_per_brand` outstanding entries **per brand** (window function). Entries are
+  coalesced per customer, and each brand is processed by its own worker pool against its own token bucket. Answers may
+  take 30s, so one worker could not use the budget.
+
+**Delivery semantics: at-least-once with idempotent effects, so the result is effectively-once.**
+- *Create* is keyed by `external_id` = our customer id. Acme rejects a second contact with `409`, which we resolve by
+  looking the contact up by email and updating it (outcome `recovered`). This covers crashes and timeouts after Acme
+  created the contact but before we stored its id.
+- *Update* sends the customer's full current snapshot (read after the queue entries were fetched), so sending it twice
+  is harmless.
+- *Recording* happens in one database transaction (`WithTx`): upsert `partner_contacts`, then mark **exactly the fetched**
+  entries processed (`AND SYQ_dProcessed IS NULL`). An entry queued while the customer was being synced stays
+  outstanding and triggers another, newer push.
+- **Consumer-side dedup.** Retries, re-queued entries and the short overlap of two leaders after a lost lock can send
+  the same PATCH more than once. Acme must tolerate repeated updates, which it should since they are idempotent. If Acme
+  supports an `Idempotency-Key` header we would send `sha256(customer id + payload)`. Question for Acme.
+- Possible improvement: remember the hash of the last payload synced per customer and skip PATCHes that change nothing,
+  which would save rate budget. There is no column to persist it, so it would live in memory or in a service-owned table.
+
+**Never drop an entry (decision).** An entry is marked processed only after a confirmed sync. The schema gives us no
+status, attempts or error columns, and we may not write anything else, so failures are tracked like this:
+- customer-specific failures (Acme rejected the data, a 409 we cannot resolve, a deleted customer) back off exponentially
+  in memory (1 min, doubling, up to 1 h), and those customers are excluded from the fetch so they do not block the
+  batch;
+- partner failures (5xx, timeouts, an open circuit, a refused API key) and database failures stop that brand for the
+  current cycle without blaming the customers; the next cycle retries;
+- orphan entries (customer row missing) and entries of brands without credentials are reported every cycle and kept.
+
+The cost is that some entries stay outstanding until somebody acts. What we would add with a schema change: a migration
+adding `SYQ_cStatus`, `SYQ_iAttempts`, `SYQ_cLastError` and `SYQ_dNextAttempt` (plus an index on
+`(SYQ_dProcessed, SYQ_dNextAttempt)`). That makes backoff durable across restarts and leader changes, lets the fetch
+filter on it, and enables a small admin tool or service to list parked entries and let an operator retry, fix or close
+them after confirming with the people involved. A dead-letter queue would play the same role in a broker-based design.
+
+**Failure catalogue (as implemented).**
+
+| Failure | Handling | What remains |
+|---|---|---|
+| DB unreachable at the start of a cycle | the cycle fails, is logged and retried after `interval` | sync delayed |
+| Leader's lock connection drops | `Lease.Held` (checked before every job, at most every `lock_check_interval`) fails, the leader stops dispatching, another replica takes over | a short overlap of two leaders: idempotent, costs a few extra calls |
+| Leader crashes or is SIGKILLed | MySQL frees the lock with the session; `wait_timeout` on the lock session bounds a zombie session after a partition | in-flight entries stay outstanding and are retried |
+| Acme timeout (> 30s), result unknown | retried; a create that did happen comes back as 409 and is recovered | unresolvable if the email changed meanwhile (see questions) |
+| Acme 5xx or network error | retried with jittered exponential backoff; the per-brand circuit breaker opens after 5 consecutive failed calls; the brand stops for the cycle | backlog grows while Acme is down |
+| 429 | the brand's token bucket pauses until `Retry-After` (seconds or HTTP date; 60s default), then resumes at the steady rate | none |
+| 401/403 (key revoked or rotated) | the brand pauses for `auth_cooldown`, error log | needs a person |
+| 422 / other 4xx | the customer backs off; the entry stays | until the data changes or someone acts |
+| 409 and the email lookup finds nothing | as 422 (`conflict_unresolved`) | needs Acme support (see questions) |
+| 404 on update (contact deleted in Acme) | created again; the new id is stored | none |
+| 2xx without an id | treated as unavailable; the retry resolves it through 409 | none |
+| DB write fails after Acme succeeded | the transaction rolls back (no half state); the next attempt recovers through 409 | extra calls |
+| Deadlock or lock wait timeout while recording | `WithTx` retries the whole transaction | none |
+| SIGTERM during a cycle | no new job starts; jobs in flight finish their call and write (`WithoutCancel`, bounded by `job_timeout`); shutdown waits for them | a hard kill is the crash case |
+| Backlog bigger than the budget | the next cycle starts immediately while batches are full *and* progress is made (no hot loop when Acme is down) | throughput is capped by Acme's limit |
+
+**Throughput.** 55 requests/minute per brand (kept below 60 so other clients can share the key) means roughly 50
+contacts per minute per brand. An initial backfill of 100k customers would take about 33 hours. Question: does Acme
+offer a bulk import for the first load?
+
+**Questions for Acme Support.**
+- Can a `409` return the existing contact id, or can contacts be looked up by `external_id`? Today a contact created
+  before a crash cannot be found if the customer's email changed in between.
+- What is the lookup response shape, and the answer when nothing matches? We assume `{"id": ...}` or `404`.
+- Is PATCH a full replace or a partial update, and how is a field cleared? We always send the full contact and omit
+  empty fields.
+- Are emails unique per account? Agents may create contacts manually; `sync.lookup_before_create` adopts them at the
+  cost of one extra call per new customer.
+- Is there a DELETE endpoint? Without one, a customer's GDPR erasure cannot be propagated, and a customer moving to
+  another brand leaves a contact behind in the old brand's account.
+- Which phone and country formats are accepted? The schema does not validate them, so 422s are likely.
+
+**Database cost.** The fetch filters on `SYQ_dProcessed IS NULL`, which has no index, so it scans `sync_queue`, a table
+that only grows. Recommended for the schema owners: an index on `(SYQ_dProcessed, SYQ_iID)` and a retention job for
+processed rows. Everything else is primary-key access.
+
 ### Cache for partner lookups
 
 - Support agents tend to repeat the same lookup while handling a ticket, so successful results are cached for a short

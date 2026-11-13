@@ -13,6 +13,7 @@ import (
 	"github.com/wmiha/vyking-3p-integration-service/internal/apierror"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/requestid"
+	"github.com/wmiha/vyking-3p-integration-service/internal/service/contactsync"
 )
 
 type fakeReadiness health.Report
@@ -148,4 +149,61 @@ func TestProfilerPrefixRequiresAuthBeforeRouting(t *testing.T) {
 			assert.Empty(t, rec.Header().Get("Location"))
 		})
 	}
+}
+
+type fakeSync struct {
+	pending bool
+	last    *contactsync.RunSummary
+}
+
+func (f *fakeSync) Trigger() bool {
+	if f.pending {
+		return false
+	}
+	f.pending = true
+	return true
+}
+
+func (f *fakeSync) LastRun() (contactsync.RunSummary, bool) {
+	if f.last == nil {
+		return contactsync.RunSummary{}, false
+	}
+	return *f.last, true
+}
+
+func TestSyncEndpoints(t *testing.T) {
+	s := &fakeSync{}
+	h := NewInternalRouter(InternalDeps{Logger: discardLogger(), Readiness: fakeReadiness{}, Sync: s})
+	do := func(method, path string) (int, map[string]any) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		return rec.Code, body
+	}
+
+	status, body := do(http.MethodGet, "/internal/sync/status")
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "no cycle has completed yet", body["status"])
+
+	status, body = do(http.MethodPost, "/internal/sync/run")
+	assert.Equal(t, http.StatusAccepted, status)
+	assert.Equal(t, true, body["triggered"])
+	status, body = do(http.MethodPost, "/internal/sync/run")
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, false, body["triggered"])
+
+	s.last = &contactsync.RunSummary{RunID: "run-1", Leader: true, Fetched: 3, Outcomes: map[string]int{"created": 2}}
+	_, body = do(http.MethodGet, "/internal/sync/status")
+	assert.Equal(t, "run-1", body["run_id"])
+	assert.Equal(t, map[string]any{"created": float64(2)}, body["outcomes"])
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/sync/run", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+
+	noSync := NewInternalRouter(InternalDeps{Logger: discardLogger(), Readiness: fakeReadiness{}})
+	rec = httptest.NewRecorder()
+	noSync.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/sync/run", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code, "endpoints exist only when the sync is enabled")
 }

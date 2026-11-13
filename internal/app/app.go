@@ -13,13 +13,16 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/acme"
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/cache"
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/handler"
 	"github.com/wmiha/vyking-3p-integration-service/internal/adapter/repository"
 	"github.com/wmiha/vyking-3p-integration-service/internal/auth"
 	"github.com/wmiha/vyking-3p-integration-service/internal/config"
+	"github.com/wmiha/vyking-3p-integration-service/internal/domain"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/database"
 	"github.com/wmiha/vyking-3p-integration-service/internal/platform/health"
+	"github.com/wmiha/vyking-3p-integration-service/internal/service/contactsync"
 	"github.com/wmiha/vyking-3p-integration-service/internal/service/transactions"
 )
 
@@ -50,6 +53,11 @@ type App struct {
 	// cancelInternal ends the request contexts of the internal server so
 	// long-running requests (CPU profiles, traces) cannot hold up shutdown.
 	cancelInternal context.CancelFunc
+
+	// syncer runs the contact sync; nil when disabled.
+	syncer   *contactsync.Syncer
+	stopSync context.CancelFunc
+	syncDone chan struct{}
 }
 
 // New wires the application. It opens connection pools lazily and does not
@@ -67,11 +75,16 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	a.internal = newHTTPServer(cfg.Server.Internal, logger, handler.NewInternalRouter(handler.InternalDeps{
+	internalDeps := handler.InternalDeps{
 		Logger:    logger,
 		Readiness: a.health,
 		Profiler:  profiler(cfg.Pprof),
-	}))
+	}
+	if cfg.Sync.Enabled {
+		a.syncer = a.contactSync()
+		internalDeps.Sync = a.syncer
+	}
+	a.internal = newHTTPServer(cfg.Server.Internal, logger, handler.NewInternalRouter(internalDeps))
 	internalCtx, cancelInternal := context.WithCancel(context.Background())
 	a.internal.BaseContext = func(net.Listener) context.Context { return internalCtx }
 	a.cancelInternal = cancelInternal
@@ -84,6 +97,54 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		a.public = newHTTPServer(cfg.Server.Public, logger, public)
 	}
 	return a, nil
+}
+
+// contactSync wires the scheduled sync. It reads and writes the primary only:
+// a lagging replica could make it push stale data and mark it processed.
+func (a *App) contactSync() *contactsync.Syncer {
+	ac := a.cfg.Acme
+	keys := make(map[domain.BrandID]string)
+	var brands []domain.BrandID
+	for _, b := range ac.ConfiguredBrands() {
+		keys[domain.BrandID(b.BrandID)] = b.APIKey
+		brands = append(brands, domain.BrandID(b.BrandID))
+	}
+	client := acme.New(acme.Config{
+		BaseURL:           ac.BaseURL,
+		RequestTimeout:    ac.RequestTimeout,
+		MaxAttempts:       ac.MaxAttempts,
+		BaseBackoff:       ac.BaseBackoff,
+		MaxBackoff:        ac.MaxBackoff,
+		DefaultRetryAfter: ac.DefaultRetryAfter,
+		RatePerMinute:     ac.RatePerMinute,
+		Burst:             ac.Burst,
+		BreakerThreshold:  ac.BreakerThreshold,
+		BreakerCooldown:   ac.BreakerCooldown,
+		AuthCooldown:      ac.AuthCooldown,
+		APIKeys:           keys,
+	}, nil, a.logger)
+
+	sc := a.cfg.Sync
+	store := repository.NewSync(a.primary, a.cfg.Database.QueryTimeout, a.cfg.Database.TxMaxRetries)
+	return contactsync.New(contactsync.Config{
+		Interval:           sc.Interval,
+		BatchPerBrand:      sc.BatchPerBrand,
+		WorkersPerBrand:    sc.WorkersPerBrand,
+		LockName:           sc.LockName,
+		JobTimeout:         sc.JobTimeout,
+		BackoffInitial:     sc.BackoffInitial,
+		BackoffMax:         sc.BackoffMax,
+		LookupBeforeCreate: sc.LookupBeforeCreate,
+		Brands:             brands,
+	}, contactsync.Deps{
+		Queue:     store,
+		Customers: store,
+		Recorder:  store,
+		Lock:      repository.NewLocker(a.primary, sc.LockSessionTimeout, sc.LockCheckInterval),
+		Writer:    client,
+		Finder:    client,
+		Logger:    a.logger,
+	})
 }
 
 // partnerAPI wires the public, partner-facing API. Its reads go to the
@@ -222,6 +283,7 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 		a.logger.Info("http server listening", "server", name, "addr", listeners[name].Addr().String())
 	}
+	a.startSync()
 
 	var runErr error
 	select {
@@ -287,6 +349,9 @@ func (a *App) shutdown() error {
 			a.logger.Info("public server stopped")
 		}
 	}
+	if err := a.stopSyncer(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	// Requests on the internal server are operational (probes, metrics,
 	// profiles): cut them short instead of waiting for them.
 	a.cancelInternal()
@@ -323,4 +388,36 @@ func (a *App) closeDatabases() error {
 		a.logger.Info("database pools closed")
 	}
 	return errors.Join(errs...)
+}
+
+// startSync runs the contact sync in the background.
+func (a *App) startSync() {
+	a.syncDone = make(chan struct{})
+	if a.syncer == nil {
+		close(a.syncDone)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.stopSync = cancel
+	go func() {
+		defer close(a.syncDone)
+		a.syncer.Run(ctx)
+	}()
+}
+
+// stopSyncer stops scheduling new work and waits for the jobs in flight:
+// they finish their Acme call and database write rather than being
+// abandoned halfway (which would be safe, only wasteful).
+func (a *App) stopSyncer(ctx context.Context) error {
+	if a.stopSync == nil {
+		return nil
+	}
+	a.stopSync()
+	select {
+	case <-a.syncDone:
+		a.logger.Info("contact sync stopped")
+		return nil
+	case <-ctx.Done():
+		return errors.New("contact sync did not stop before the shutdown timeout; in-flight entries stay outstanding")
+	}
 }

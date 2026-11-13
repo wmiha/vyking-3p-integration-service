@@ -227,6 +227,7 @@ func TestShippedConfigs(t *testing.T) {
 				// Secrets every non-local environment requires.
 				"DB_HOST": "mysql", "DB_NAME": "vyking", "DB_USER": "app", "DB_PASSWORD": "secret",
 				"AUTH_KEY_ID": "2026-11", "AUTH_JWT_SECRET": "prod-like-secret-0123456789-0123456789",
+				"ACME_BASE_URL": "https://api.acme-support.example", "ACME_API_KEY_BRAND_1": "k1",
 			}))
 			require.NoError(t, err)
 			assert.Equal(t, env, cfg.App.Env)
@@ -417,4 +418,83 @@ func TestCacheConfig(t *testing.T) {
 
 	_, err = Parse([]byte(validYAML+"cache: {enabled: false}\n"), mapLookup(nil))
 	assert.NoError(t, err, "a disabled cache needs no settings")
+}
+
+const syncYAML = `
+acme:
+  base_url: http://acme
+  request_timeout: 35s
+  max_attempts: 3
+  base_backoff: 1s
+  max_backoff: 30s
+  default_retry_after: 60s
+  rate_per_minute: 55
+  burst: 10
+  breaker_threshold: 5
+  breaker_cooldown: 1m
+  auth_cooldown: 15m
+  brands:
+    - {brand_id: 1, api_key: "${KEY_1:-}"}
+    - {brand_id: 2, api_key: "${KEY_2:-}"}
+sync:
+  enabled: ${SYNC_ENABLED:-true}
+  interval: 30s
+  batch_per_brand: 50
+  workers_per_brand: 4
+  job_timeout: 2m
+  lock_name: sync
+  lock_session_timeout: 120s
+  lock_check_interval: 5s
+  backoff_initial: 1m
+  backoff_max: 1h
+`
+
+func TestSyncConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        map[string]string
+		replace    [2]string
+		wantBrands []uint32
+		wantErr    string
+	}{
+		{name: "brands without a key are skipped", wantBrands: []uint32{1}},
+		{name: "both brands", env: map[string]string{"KEY_2": "k2"}, wantBrands: []uint32{1, 2}},
+		{name: "no key at all", env: map[string]string{"KEY_1": ""},
+			wantErr: "sync is enabled but no brand has an Acme Support API key"},
+		{name: "disabled sync needs no credentials", env: map[string]string{"KEY_1": "", "SYNC_ENABLED": "false"}},
+		{name: "duplicated brand", replace: [2]string{"brand_id: 2", "brand_id: 1"},
+			wantErr: "brand_id 1 is missing or duplicated"},
+		{name: "backoff max below initial", replace: [2]string{"backoff_max: 1h", "backoff_max: 1s"},
+			wantErr: "sync.backoff_max must be >= sync.backoff_initial"},
+		{name: "lock check slower than session timeout", replace: [2]string{"lock_check_interval: 5s", "lock_check_interval: 5m"},
+			wantErr: "sync.lock_session_timeout must exceed sync.lock_check_interval"},
+		{name: "no workers", replace: [2]string{"workers_per_brand: 4", "workers_per_brand: 0"},
+			wantErr: "sync.batch_per_brand and sync.workers_per_brand must be at least 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := validYAML + syncYAML
+			if tt.replace[0] != "" {
+				raw = strings.Replace(raw, tt.replace[0], tt.replace[1], 1)
+			}
+			env := map[string]string{"KEY_1": "k1"}
+			for k, v := range tt.env {
+				env[k] = v
+			}
+			cfg, err := Parse([]byte(raw), mapLookup(env))
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if !cfg.Sync.Enabled {
+				return
+			}
+			var ids []uint32
+			for _, b := range cfg.Acme.ConfiguredBrands() {
+				ids = append(ids, b.BrandID)
+			}
+			assert.Equal(t, tt.wantBrands, ids)
+		})
+	}
 }

@@ -90,6 +90,35 @@ curl -s -H "Authorization: Bearer $TOKEN_VALID_BRAND_1" \
   'localhost:8080/v1/transactions?email=jane.doe@example.com&limit=5' | jq
 ```
 
+## Contact sync
+
+A background job in every instance; only the replica holding a MySQL named lock syncs in a given cycle. Each cycle:
+
+1. fetches the oldest outstanding `sync_queue` entries **per brand** (so one brand's backlog cannot starve another);
+2. coalesces entries per customer and pushes the customer's *current* data to Acme Support with the brand's API key
+   (update if the contact id is known, otherwise create; a `409` is resolved through the email lookup);
+3. stores the contact id in `partner_contacts` and marks exactly the fetched entries processed, **in one transaction**.
+
+Entries are only marked processed after a confirmed sync: failures leave them outstanding (customers whose data Acme
+rejects are retried with an exponential backoff). Cycles run every `sync.interval`, immediately again while there is a
+backlog, or on demand:
+
+```sh
+make up seed                                         # stack with the Acme mock and sample data
+make logs                                            # "customer synced" / "sync cycle finished" lines (run_id, outcomes)
+curl -s localhost:9090/internal/sync/status | jq     # last cycle: leader, fetched, outcomes, backing off, ...
+curl -s -X POST localhost:9090/internal/sync/run     # run a cycle now
+curl -s localhost:8081/_debug/contacts | jq          # what the Acme mock received
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `SYNC_ENABLED` | `false` disables the sync (e.g. API-only deployments) |
+| `ACME_BASE_URL` | Acme Support API base URL (compose: the mock) |
+| `ACME_API_KEY_BRAND_<n>` | API key per brand; brands without a key are not synced and their entries stay outstanding |
+
+Rate limit, retry, backoff and concurrency settings are in the `acme` and `sync` sections of `config/*.yaml`.
+
 ## Partner authentication
 
 The partner API expects `Authorization: Bearer <token>`, where the token is an HS256 JWT issued by us that lists the brands

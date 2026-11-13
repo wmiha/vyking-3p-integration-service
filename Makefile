@@ -42,7 +42,7 @@ IT_PACKAGES := ./test/integration/... ./internal/adapter/repository/...
 
 test-integration: ## Run integration tests against a throwaway MySQL (always torn down; CI-friendly)
 	@rc=0; \
-	$(IT_COMPOSE) up -d --wait mysql && $(IT_COMPOSE) run --rm flyway migrate || rc=$$?; \
+	$(IT_COMPOSE) up -d --build --wait mysql acmemock && $(IT_COMPOSE) run --rm flyway migrate || rc=$$?; \
 	if [ $$rc -eq 0 ]; then $(GO) test -tags=integration -count=1 -p 1 -v $(IT_PACKAGES) || rc=$$?; fi; \
 	$(IT_COMPOSE) down -v --remove-orphans; \
 	if [ $$rc -ne 0 ]; then echo "integration tests FAILED (exit $$rc)"; fi; \

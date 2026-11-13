@@ -47,6 +47,59 @@ type Config struct {
 	Auth       Auth       `yaml:"auth"`
 	PartnerAPI PartnerAPI `yaml:"partner_api"`
 	Cache      Cache      `yaml:"cache"`
+	Acme       Acme       `yaml:"acme"`
+	Sync       Sync       `yaml:"sync"`
+}
+
+// Acme configures the Acme Support API client.
+type Acme struct {
+	BaseURL string `yaml:"base_url"`
+	// RequestTimeout bounds one HTTP attempt; Acme answers may take 30s.
+	RequestTimeout    time.Duration `yaml:"request_timeout"`
+	MaxAttempts       int           `yaml:"max_attempts"`
+	BaseBackoff       time.Duration `yaml:"base_backoff"`
+	MaxBackoff        time.Duration `yaml:"max_backoff"`
+	DefaultRetryAfter time.Duration `yaml:"default_retry_after"`
+	// RatePerMinute and Burst shape the per-brand token bucket.
+	RatePerMinute    int           `yaml:"rate_per_minute"`
+	Burst            int           `yaml:"burst"`
+	BreakerThreshold int           `yaml:"breaker_threshold"`
+	BreakerCooldown  time.Duration `yaml:"breaker_cooldown"`
+	AuthCooldown     time.Duration `yaml:"auth_cooldown"`
+	Brands           []AcmeBrand   `yaml:"brands"`
+}
+
+// AcmeBrand holds one brand's Acme Support API key.
+type AcmeBrand struct {
+	BrandID uint32 `yaml:"brand_id"`
+	APIKey  string `yaml:"api_key"`
+}
+
+// ConfiguredBrands returns the brands with an API key; entries without a key
+// are empty slots (the brand is not synced).
+func (a Acme) ConfiguredBrands() []AcmeBrand {
+	var out []AcmeBrand
+	for _, b := range a.Brands {
+		if b.APIKey != "" {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// Sync configures the scheduled contact sync.
+type Sync struct {
+	Enabled            bool          `yaml:"enabled"`
+	Interval           time.Duration `yaml:"interval"`
+	BatchPerBrand      int           `yaml:"batch_per_brand"`
+	WorkersPerBrand    int           `yaml:"workers_per_brand"`
+	JobTimeout         time.Duration `yaml:"job_timeout"`
+	LockName           string        `yaml:"lock_name"`
+	LockSessionTimeout time.Duration `yaml:"lock_session_timeout"`
+	LockCheckInterval  time.Duration `yaml:"lock_check_interval"`
+	BackoffInitial     time.Duration `yaml:"backoff_initial"`
+	BackoffMax         time.Duration `yaml:"backoff_max"`
+	LookupBeforeCreate bool          `yaml:"lookup_before_create"`
 }
 
 // Cache configures the short-lived partner lookup cache.
@@ -305,6 +358,10 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Pprof.validate()...)
 	errs = append(errs, c.Database.validate()...)
 	errs = append(errs, c.Auth.validate()...)
+	if c.Sync.Enabled {
+		errs = append(errs, c.Sync.validate()...)
+		errs = append(errs, c.Acme.validate()...)
+	}
 	if c.Cache.Enabled && (c.Cache.TTL <= 0 || c.Cache.MaxEntries < 1 || c.Cache.SweepInterval <= 0) {
 		errs = append(errs, errors.New("cache.ttl, cache.max_entries and cache.sweep_interval must be positive when the cache is enabled"))
 	}
@@ -444,6 +501,62 @@ func (h *HTTPServer) validate(prefix string) []error {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s.%s must be positive", prefix, name))
 		}
+	}
+	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
+	return errs
+}
+
+func (s *Sync) validate() []error {
+	var errs []error
+	for name, d := range map[string]time.Duration{
+		"interval": s.Interval, "job_timeout": s.JobTimeout, "lock_session_timeout": s.LockSessionTimeout,
+		"lock_check_interval": s.LockCheckInterval, "backoff_initial": s.BackoffInitial,
+	} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("sync.%s must be positive", name))
+		}
+	}
+	if s.BackoffMax < s.BackoffInitial {
+		errs = append(errs, errors.New("sync.backoff_max must be >= sync.backoff_initial"))
+	}
+	if s.BatchPerBrand < 1 || s.WorkersPerBrand < 1 {
+		errs = append(errs, errors.New("sync.batch_per_brand and sync.workers_per_brand must be at least 1"))
+	}
+	if s.LockName == "" {
+		errs = append(errs, errors.New("sync.lock_name is required"))
+	}
+	if s.LockSessionTimeout <= s.LockCheckInterval {
+		errs = append(errs, errors.New("sync.lock_session_timeout must exceed sync.lock_check_interval"))
+	}
+	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
+	return errs
+}
+
+func (a *Acme) validate() []error {
+	var errs []error
+	if a.BaseURL == "" {
+		errs = append(errs, errors.New("acme.base_url is required"))
+	}
+	for name, d := range map[string]time.Duration{
+		"request_timeout": a.RequestTimeout, "base_backoff": a.BaseBackoff, "max_backoff": a.MaxBackoff,
+		"default_retry_after": a.DefaultRetryAfter, "breaker_cooldown": a.BreakerCooldown, "auth_cooldown": a.AuthCooldown,
+	} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("acme.%s must be positive", name))
+		}
+	}
+	if a.MaxAttempts < 1 || a.RatePerMinute < 1 || a.Burst < 1 || a.BreakerThreshold < 1 {
+		errs = append(errs, errors.New("acme.max_attempts, rate_per_minute, burst and breaker_threshold must be at least 1"))
+	}
+	seen := map[uint32]bool{}
+	for _, b := range a.Brands {
+		if b.BrandID == 0 || seen[b.BrandID] {
+			errs = append(errs, fmt.Errorf("acme.brands: brand_id %d is missing or duplicated", b.BrandID))
+		}
+		seen[b.BrandID] = true
+	}
+	if len(a.ConfiguredBrands()) == 0 {
+		errs = append(errs, errors.New("sync is enabled but no brand has an Acme Support API key (acme.brands)"))
 	}
 	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 	return errs

@@ -26,6 +26,8 @@ type InternalDeps struct {
 	Readiness ReadinessChecker
 	// Profiler enables /debug/pprof/* behind Basic auth; nil disables it.
 	Profiler *Credentials
+	// Sync exposes the contact sync trigger and status; nil when disabled.
+	Sync SyncControl
 }
 
 // Credentials for HTTP Basic authentication.
@@ -40,6 +42,10 @@ func NewInternalRouter(d InternalDeps) http.Handler {
 	rt := newRouter()
 	rt.handle(http.MethodGet, "/health", http.HandlerFunc(liveness))
 	rt.handle(http.MethodGet, "/ready", readiness(d.Readiness))
+	if d.Sync != nil {
+		rt.handle(http.MethodPost, "/internal/sync/run", triggerSync(d.Sync))
+		rt.handle(http.MethodGet, "/internal/sync/status", syncStatus(d.Sync))
+	}
 	if d.Profiler != nil {
 		registerPprof(rt)
 		rt.guard("/debug/pprof", BasicAuth("pprof", d.Profiler.Username, d.Profiler.Password))

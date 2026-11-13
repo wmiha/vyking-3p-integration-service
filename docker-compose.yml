@@ -88,12 +88,18 @@ services:
       DB_NAME: ${DB_NAME:-vyking}
       DB_USER: ${DB_USER:-app}
       DB_PASSWORD: ${DB_PASSWORD:-app-dev-only}
+      ACME_BASE_URL: ${ACME_BASE_URL:-http://acmemock:8081}
+      ACME_API_KEY_BRAND_1: ${ACME_API_KEY_BRAND_1:-acme-key-brand-1-dev-only}
+      ACME_API_KEY_BRAND_2: ${ACME_API_KEY_BRAND_2:-acme-key-brand-2-dev-only}
+      SYNC_ENABLED: ${SYNC_ENABLED:-true}
     ports:
       - "${PUBLIC_PORT:-8080}:8080"
       - "${INTERNAL_PORT:-9090}:9090"
     depends_on:
       flyway:
         condition: service_completed_successfully
+      acmemock:
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/server", "healthcheck"]
       interval: 5s

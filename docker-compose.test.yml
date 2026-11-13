@@ -49,3 +49,17 @@ services:
       mysql:
         condition: service_healthy
     mem_limit: 384m
+
+  # Acme Support stand-in with a generous rate limit so tests do not wait on
+  # the 60/min budget (the real limit is exercised in the end-to-end run).
+  acmemock:
+    build:
+      context: .
+      target: acmemock
+    image: vyking-acmemock:local
+    command: ["-addr=:8081", "-rate=6000", "-burst=100", "-latency-min=0s", "-latency-max=5ms"]
+    environment:
+      ACME_MOCK_KEYS: it-acme-key-1,it-acme-key-2
+    ports:
+      - "${IT_ACME_PORT:-18081}:8081"
+    mem_limit: 64m
