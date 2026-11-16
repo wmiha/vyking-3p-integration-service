@@ -375,3 +375,4 @@ scripts/                    seed, tokengen, acmemock (development tools)
 test/integration/           end-to-end tests against the throwaway stack
 deploy/observability/       Prometheus scrape config, Grafana provisioning and dashboard
 ```
+Finally, once your application is running locally, you can import the [`Postman collection`](vyking-local.postman_collection.json) into your Postman client to manually test and trigger the API endpoints and observe the logs and metrics.

@@ -1,0 +1,1857 @@
+{
+  "info": {
+    "name": "Vyking 3P integration (local)",
+    "description": "Local stack in WSL. The collection variable \"host\" defaults to localhost; if that stops working, run `vhost` in PowerShell and paste the WSL IP it copies. Tokens are signed fresh before every request with the dummy local key from config/local.yaml. See docs/LOCAL-RUNBOOK.md.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Signs fresh local test tokens before every request (HS256, dummy key from config/local.yaml).",
+          "const CryptoJS = require('crypto-js');",
+          "const kid = pm.collectionVariables.get('jwt_kid');",
+          "const secret = pm.collectionVariables.get('jwt_secret');",
+          "const b64url = (words) => CryptoJS.enc.Base64.stringify(words).replace(/=+$/, '').replace(/\\+/g, '-').replace(/\\//g, '_');",
+          "const part = (obj) => b64url(CryptoJS.enc.Utf8.parse(JSON.stringify(obj)));",
+          "const now = Math.floor(Date.now() / 1000);",
+          "",
+          "function sign(overrides, key, alg) {",
+          "  const header = { alg: alg || 'HS256', typ: 'JWT', kid: kid };",
+          "  const claims = Object.assign({",
+          "    iss: 'vyking-integration', aud: 'vyking-partner-api', sub: 'acme-support',",
+          "    brands: [1], scope: 'transactions:read',",
+          "    iat: now, nbf: now, exp: now + 3600, jti: 'postman-' + now",
+          "  }, overrides);",
+          "  const input = part(header) + '.' + part(claims);",
+          "  if (alg === 'none') return input + '.';",
+          "  return input + '.' + b64url(CryptoJS.HmacSHA256(input, key || secret));",
+          "}",
+          "",
+          "const tokens = {",
+          "  token_brand_1: sign({ brands: [1] }),",
+          "  token_brand_2: sign({ brands: [2] }),",
+          "  token_brands_1_2: sign({ brands: [1, 2] }),",
+          "  token_all_brands: sign({ brands: [1, 2, 3] }),",
+          "  token_expired: sign({ iat: now - 7200, nbf: now - 7200, exp: now - 3600 }),",
+          "  token_not_yet_valid: sign({ nbf: now + 3600 }),",
+          "  token_no_scope: sign({ scope: '' }),",
+          "  token_no_brands: sign({ brands: [] }),",
+          "  token_wrong_audience: sign({ aud: 'some-other-api' }),",
+          "  token_wrong_signature: sign({}, 'not-the-real-secret-0123456789abcdef'),",
+          "  token_alg_none: sign({}, null, 'none')",
+          "};",
+          "Object.keys(tokens).forEach((k) => pm.collectionVariables.set(k, tokens[k]));"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "if (!pm.request.url.getPath().startsWith('/_debug')) { // the Acme mock is not our service",
+          "  pm.test('every response carries X-Request-ID', () => pm.response.to.have.header('X-Request-ID'));",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "host",
+      "value": "localhost",
+      "description": "localhost while WSL forwarding works; otherwise the WSL IP. Run `vhost` in PowerShell: it prints the working value and copies it to the clipboard."
+    },
+    {
+      "key": "public_port",
+      "value": "8080"
+    },
+    {
+      "key": "internal_port",
+      "value": "9090"
+    },
+    {
+      "key": "acme_port",
+      "value": "8081"
+    },
+    {
+      "key": "jwt_kid",
+      "value": "local-1",
+      "description": "auth.keys[0].kid from config/local.yaml"
+    },
+    {
+      "key": "jwt_secret",
+      "value": "local-dev-only-jwt-secret-0123456789",
+      "description": "dummy local secret from config/local.yaml"
+    },
+    {
+      "key": "pprof_user",
+      "value": "pprof"
+    },
+    {
+      "key": "pprof_password",
+      "value": "pprof-dev-only"
+    },
+    {
+      "key": "jane_cursor",
+      "value": ""
+    },
+    {
+      "key": "heavy_cursor",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Partner API (public :8080)",
+      "item": [
+        {
+          "name": "Jane, brand 1, first page",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('transactions use Acme statuses', () => body.transactions.forEach((t) => pm.expect(['pending', 'completed', 'failed', 'cancelled']).to.include(t.status)));",
+                  "pm.collectionVariables.set('jane_cursor', body.page.next_cursor || '');",
+                  "console.log('jane_cursor =', body.page.next_cursor, '| has_more =', body.page.has_more);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&limit=5",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "Customer 1001 (EUR). Saves page.next_cursor into {{jane_cursor}}."
+          }
+        },
+        {
+          "name": "Jane, next page (saved cursor)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('transactions use Acme statuses', () => body.transactions.forEach((t) => pm.expect(['pending', 'completed', 'failed', 'cancelled']).to.include(t.status)));",
+                  "pm.collectionVariables.set('jane_cursor', body.page.next_cursor || '');",
+                  "console.log('jane_cursor =', body.page.next_cursor, '| has_more =', body.page.has_more);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&limit=5&cursor={{jane_cursor}}",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{jane_cursor}}"
+                }
+              ]
+            },
+            "description": "Run \"Jane, brand 1, first page\" first, then this one repeatedly until has_more is false."
+          }
+        },
+        {
+          "name": "Status filter failed,cancelled",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('only failed or cancelled', () => pm.response.json().transactions.forEach((t) => pm.expect(['failed', 'cancelled']).to.include(t.status)));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&status=failed,cancelled",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "status",
+                  "value": "failed,cancelled"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Ambiguous email in brands 1+2 (409)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 409', () => pm.response.to.have.status(409));",
+                  "pm.test('error code customer_ambiguous', () => pm.expect(pm.response.json().error.code).to.eql('customer_ambiguous'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brands_1_2}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            },
+            "description": "The same email exists in brand 1 (1001) and brand 2 (1002); details.brand_ids lists them."
+          }
+        },
+        {
+          "name": "Disambiguated with brand_id=2",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('customer 1002', () => pm.expect(pm.response.json().customer.id).to.eql('1002'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brands_1_2}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&brand_id=2",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "brand_id",
+                  "value": "2"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "JPY amounts (0 decimals)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=taro@example.jp",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "taro@example.jp"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "BHD amounts (3 decimals)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=ali@example.bh",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "ali@example.bh"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "USD amounts (minor units NULL in DB)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_2}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=sam@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "sam@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Heavy customer, first 100",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('transactions use Acme statuses', () => body.transactions.forEach((t) => pm.expect(['pending', 'completed', 'failed', 'cancelled']).to.include(t.status)));",
+                  "pm.collectionVariables.set('heavy_cursor', body.page.next_cursor || '');",
+                  "console.log('heavy_cursor =', body.page.next_cursor, '| has_more =', body.page.has_more);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=heavy@example.com&limit=100",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "heavy@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                }
+              ]
+            },
+            "description": "Customer 1009 has 250 transactions: 3 pages of 100."
+          }
+        },
+        {
+          "name": "Heavy customer, next 100 (saved cursor)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('transactions use Acme statuses', () => body.transactions.forEach((t) => pm.expect(['pending', 'completed', 'failed', 'cancelled']).to.include(t.status)));",
+                  "pm.collectionVariables.set('heavy_cursor', body.page.next_cursor || '');",
+                  "console.log('heavy_cursor =', body.page.next_cursor, '| has_more =', body.page.has_more);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=heavy@example.com&limit=100&cursor={{heavy_cursor}}",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "heavy@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{heavy_cursor}}"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Cursor of another customer (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_cursor', () => pm.expect(pm.response.json().error.code).to.eql('invalid_cursor'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=heavy@example.com&limit=100&cursor={{jane_cursor}}",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "heavy@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "100"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{jane_cursor}}"
+                }
+              ]
+            },
+            "description": "Replays Jane's cursor for another customer: cursors are bound to their customer and filter. Run a Jane page first."
+          }
+        },
+        {
+          "name": "Customer of another brand (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));",
+                  "pm.test('error code customer_not_found', () => pm.expect(pm.response.json().error.code).to.eql('customer_not_found'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=poker@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "poker@example.com"
+                }
+              ]
+            },
+            "description": "poker@example.com is brand 3; the token only covers brand 1, so it is reported as not found."
+          }
+        },
+        {
+          "name": "brand_id outside the token (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 403', () => pm.response.to.have.status(403));",
+                  "pm.test('error code brand_forbidden', () => pm.expect(pm.response.json().error.code).to.eql('brand_forbidden'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&brand_id=2",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "brand_id",
+                  "value": "2"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "limit is not a number (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_parameter', () => pm.expect(pm.response.json().error.code).to.eql('invalid_parameter'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&limit=ten",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "ten"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "limit above max (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_parameter', () => pm.expect(pm.response.json().error.code).to.eql('invalid_parameter'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&limit=101",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "limit",
+                  "value": "101"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "unknown status (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_parameter', () => pm.expect(pm.response.json().error.code).to.eql('invalid_parameter'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&status=settled",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "status",
+                  "value": "settled"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "invalid email (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_parameter', () => pm.expect(pm.response.json().error.code).to.eql('invalid_parameter'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=not-an-email",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "not-an-email"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "invalid cursor (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error code invalid_cursor', () => pm.expect(pm.response.json().error.code).to.eql('invalid_cursor'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com&cursor=garbage",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                },
+                {
+                  "key": "cursor",
+                  "value": "garbage"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Unknown route (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));",
+                  "pm.test('error code not_found', () => pm.expect(pm.response.json().error.code).to.eql('not_found'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/unknown",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "unknown"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wrong method (405)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 405', () => pm.response.to.have.status(405));",
+                  "pm.test('error code method_not_allowed', () => pm.expect(pm.response.json().error.code).to.eql('method_not_allowed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_brand_1}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Authentication matrix",
+      "item": [
+        {
+          "name": "No token (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code unauthorized', () => pm.expect(pm.response.json().error.code).to.eql('unauthorized'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Expired (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_expired', () => pm.expect(pm.response.json().error.code).to.eql('token_expired'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_expired}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Not yet valid (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_invalid', () => pm.expect(pm.response.json().error.code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_not_yet_valid}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wrong signature (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_invalid', () => pm.expect(pm.response.json().error.code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_wrong_signature}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Wrong audience (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_invalid', () => pm.expect(pm.response.json().error.code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_wrong_audience}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "No brands (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_invalid', () => pm.expect(pm.response.json().error.code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_no_brands}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "alg none (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_invalid', () => pm.expect(pm.response.json().error.code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_alg_none}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "No transactions:read scope (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 403', () => pm.response.to.have.status(403));",
+                  "pm.test('error code insufficient_scope', () => pm.expect(pm.response.json().error.code).to.eql('insufficient_scope'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_no_scope}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Malformed token (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error code token_malformed', () => pm.expect(pm.response.json().error.code).to.eql('token_malformed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "this-is-not-a-jwt",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{public_port}}/v1/transactions?email=jane.doe@example.com",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{public_port}}",
+              "path": [
+                "v1",
+                "transactions"
+              ],
+              "query": [
+                {
+                  "key": "email",
+                  "value": "jane.doe@example.com"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Internal: probes and contact sync (:9090)",
+      "item": [
+        {
+          "name": "Liveness /health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/health",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "health"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Readiness /ready",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/ready",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "ready"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Sync status (last cycle)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/internal/sync/status",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "internal",
+                "sync",
+                "status"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Run a sync cycle now",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('accepted (202) or already pending (200)', () => pm.expect(pm.response.code).to.be.oneOf([200, 202]));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/internal/sync/run",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "internal",
+                "sync",
+                "run"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Prometheus metrics",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('has sync metrics', () => pm.expect(pm.response.text()).to.include('vyking_sync_cycles_total'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/metrics",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "metrics"
+              ]
+            }
+          }
+        },
+        {
+          "name": "pprof index (Basic auth)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{pprof_user}}",
+                  "type": "string"
+                },
+                {
+                  "key": "password",
+                  "value": "{{pprof_password}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "raw": "http://{{host}}:{{internal_port}}/debug/pprof/",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{internal_port}}",
+              "path": [
+                "debug",
+                "pprof"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Acme mock (:8081)",
+      "item": [
+        {
+          "name": "Contacts received by the mock",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{acme_port}}/_debug/contacts",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{acme_port}}",
+              "path": [
+                "_debug",
+                "contacts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Mock request counters",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{acme_port}}/_debug/stats",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{acme_port}}",
+              "path": [
+                "_debug",
+                "stats"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Reset the mock (forgets all contacts)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 204', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            },
+            "url": {
+              "raw": "http://{{host}}:{{acme_port}}/_debug/reset",
+              "protocol": "http",
+              "host": [
+                "{{host}}"
+              ],
+              "port": "{{acme_port}}",
+              "path": [
+                "_debug",
+                "reset"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
