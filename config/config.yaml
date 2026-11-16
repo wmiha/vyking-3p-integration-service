@@ -1,27 +1,34 @@
-# staging environment. Mounted as a ConfigMap in Kubernetes; secrets are
-# injected as environment variables and referenced as ${VAR} placeholders.
+# Service configuration, the same file in every environment. In Kubernetes it
+# is mounted as a ConfigMap; what differs per environment (and every secret)
+# is injected as environment variables. Local development takes its dummy
+# values from config/local.env (make run, make tokens, docker compose).
+#
+# Placeholders: ${VAR} is required, ${VAR:-default} falls back when VAR is
+# unset or empty. Quote placeholders that must stay strings (secrets!).
+# Defaults are safe for production; secrets and endpoints have none, so a
+# deployment that forgets one fails at start-up.
 app:
   name: vyking-3p-integration-service
-  env: staging
+  env: ${APP_ENV} # local|dev|staging|prod, a label for logs
 
 log:
   level: ${LOG_LEVEL:-info}
-  format: json
+  format: ${LOG_FORMAT:-json} # text|json
 
 server:
   # terminationGracePeriodSeconds must exceed drain_delay + shutdown_timeout.
   shutdown_timeout: 45s
-  drain_delay: 5s # let the endpoints controller remove the pod first
+  drain_delay: ${DRAIN_DELAY:-5s} # let the endpoints controller remove the pod first
   readiness_timeout: 2s # per /ready dependency check
   public:
     enabled: ${PUBLIC_ENABLED:-true}
-    addr: ":8080"
+    addr: "${PUBLIC_ADDR:-:8080}"
     read_header_timeout: 5s
     read_timeout: 10s
     write_timeout: 15s
     idle_timeout: 60s
   internal: # ClusterIP only, never exposed through the ingress
-    addr: ":9090"
+    addr: "${INTERNAL_ADDR:-:9090}"
     read_header_timeout: 5s
     read_timeout: 10s
     write_timeout: 15s
@@ -54,8 +61,8 @@ database:
     read_timeout: 30s
     write_timeout: 30s
     pool:
-      max_open_conns: 20
-      max_idle_conns: 10
+      max_open_conns: ${DB_POOL_MAX_OPEN:-40}
+      max_idle_conns: ${DB_POOL_MAX_IDLE:-20}
       conn_max_lifetime: 30m # below proxy / server idle timeouts
       conn_max_idle_time: 5m
   replica:
@@ -70,8 +77,8 @@ database:
     read_timeout: 30s
     write_timeout: 30s
     pool:
-      max_open_conns: 20
-      max_idle_conns: 10
+      max_open_conns: ${DB_REPLICA_POOL_MAX_OPEN:-40}
+      max_idle_conns: ${DB_REPLICA_POOL_MAX_IDLE:-20}
       conn_max_lifetime: 30m
       conn_max_idle_time: 5m
 
@@ -126,13 +133,13 @@ acme:
 # Scheduled contact sync (sync_queue -> Acme Support contacts).
 sync:
   enabled: ${SYNC_ENABLED:-true}
-  interval: 30s
-  batch_per_brand: 50
-  workers_per_brand: 4
-  job_timeout: 2m
-  lock_name: vyking-3p-contact-sync
-  lock_session_timeout: 300s # must exceed job_timeout + lock_check_interval
-  lock_check_interval: 5s
-  backoff_initial: 1m
+  interval: 30s              # pause between cycles when there is no backlog
+  batch_per_brand: 50        # entries per brand and cycle (~1 min of a brand's rate budget)
+  workers_per_brand: 4       # concurrent customers per brand; Acme may take 30s per call
+  job_timeout: 2m            # one customer including retries
+  lock_name: vyking-3p-contact-sync # MySQL named lock: one syncing replica at a time
+  lock_session_timeout: 300s # a vanished leader's lock is freed after this long; must exceed job_timeout + lock_check_interval
+  lock_check_interval: 5s    # how often the leader re-checks it still holds the lock
+  backoff_initial: 1m        # retry delay for customers Acme rejected; doubles per failure
   backoff_max: 1h
-  lookup_before_create: false
+  lookup_before_create: false # true: adopt contacts created manually in Acme (one more call)

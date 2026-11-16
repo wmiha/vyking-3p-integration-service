@@ -1,7 +1,8 @@
 // Command tokengen issues partner bearer tokens for local testing.
 //
 // It reads issuer, audience and signing keys from the service configuration
-// (APP_ENV / CONFIG_PATH, like the service), so generated tokens always match
+// (config/config.yaml + environment, like the service; `make tokens` supplies
+// config/local.env), so generated tokens always match
 // what the running service verifies.
 //
 //	go run ./scripts/tokengen -matrix                   # named test tokens as TOKEN_*=... lines

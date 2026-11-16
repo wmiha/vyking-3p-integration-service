@@ -90,9 +90,16 @@ decision, its alternatives and its trade-offs. "Load and scalability" and "What 
 
 ### Configuration
 
-- **Per-environment YAML + environment variables.** `config/<APP_ENV>.yaml` holds every tunable (timeouts, pool sizes,
-  rate limits, schedules) so it can be reviewed and diffed; values may reference `${VAR}` / `${VAR:-default}` so secrets and
-  per-deployment values come from the environment (Kubernetes ConfigMap + Secret). Real credentials never live in the repo.
+- **One YAML file + environment variables ("build once, configure at deploy time").** `config/config.yaml` holds every
+  tunable (timeouts, pool sizes, rate limits, schedules) with production defaults, so it can be reviewed and diffed. What
+  differs between environments is a `${VAR:-default}` placeholder; its values belong to the deployment (Helm values or
+  Kustomize overlays in a deploy repo, mounted as ConfigMap + Secret), not to the image. Secrets and endpoints are
+  `${VAR}` without a default, so a forgotten one stops the start-up instead of falling back to a dev value; a test
+  asserts exactly which variables are required. Dummy local values live in `config/local.env`. Real credentials never
+  live in the repo.
+  - *Alternative considered:* one full file per environment (the first version). Every environment's settings are
+    visible in this repo, but the files were almost identical and could drift silently, and prod configuration ships inside every
+    image. The cost of the single file: per-environment values are no longer visible here.
 - **Placeholders are expanded per YAML scalar, not on raw text.** A secret containing YAML syntax (`:`, `#`, quotes, newlines)
   cannot change the document structure. Unquoted placeholders take the type of their value (`${PORT:-3306}` → int), quoted
   ones always stay strings.

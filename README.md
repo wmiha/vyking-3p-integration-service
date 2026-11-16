@@ -215,7 +215,7 @@ curl -s localhost:8081/_debug/contacts | jq          # what the Acme mock receiv
 | `ACME_BASE_URL` | Acme Support API base URL (compose: the mock) |
 | `ACME_API_KEY_BRAND_<n>` | API key per brand; brands without a key are not synced and their entries stay outstanding |
 
-Rate limit, retry, backoff and concurrency settings are in the `acme` and `sync` sections of `config/*.yaml`.
+Rate limit, retry, backoff and concurrency settings are in the `acme` and `sync` sections of `config/config.yaml`.
 
 ## Observability
 
@@ -291,24 +291,27 @@ Every fixture has outstanding `sync_queue` entries, some customers several (coal
 
 ## Configuration
 
-Configuration lives in per-environment YAML files under [`config/`](config):
+One file for every environment, [`config/config.yaml`](config/config.yaml) (`CONFIG_PATH` points elsewhere, for
+example at a mounted ConfigMap). Values may reference environment variables: `${VAR}` (required) or `${VAR:-default}`.
+What differs between environments, secrets included, is injected as environment variables (in Kubernetes from the
+deployment's values and a Secret). Defaults are production values; secrets and endpoints have none, so a deployment that
+forgets one fails at start-up with the list of missing variables. Unknown keys and invalid values fail fast too.
 
-| Variable      | Purpose                                              | Default          |
-|---------------|------------------------------------------------------|------------------|
-| `APP_ENV`     | Selects `config/<env>.yaml` (`local`, `dev`, `staging`, `prod`) | `local` |
-| `CONFIG_DIR`  | Directory containing the environment files           | `config`         |
-| `CONFIG_PATH` | Explicit config file path (overrides the two above)  | –                |
+For local development, [`config/local.env`](config/local.env) holds dummy values. `make run`, `make tokens` and the
+compose `app` service read it; variables already set in the shell win (`LOG_LEVEL=warn make run`).
 
-Values in the YAML may reference environment variables: `${VAR}` (required) or `${VAR:-default}`. Secrets are only ever
-provided through environment variables. Unknown keys and invalid values fail fast at startup.
-
-Main environment variables (see the YAML files for every tunable):
+Main environment variables (see `config/config.yaml` for every tunable):
 
 | Variable | Purpose |
 |----------|---------|
+| `APP_ENV` | required: `local`, `dev`, `staging` or `prod`, attached to every log line |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | primary database (writes and sync reads) |
 | `DB_REPLICA_ENABLED`, `DB_REPLICA_HOST`, `DB_REPLICA_PORT`, `DB_REPLICA_USER`, `DB_REPLICA_PASSWORD` | optional read replica for partner API reads |
+| `DB_POOL_MAX_OPEN`, `DB_POOL_MAX_IDLE`, `DB_REPLICA_POOL_MAX_OPEN`, `DB_REPLICA_POOL_MAX_IDLE` | connections per pod and pool (default 40 / 20) |
+| `AUTH_KEY_ID`, `AUTH_JWT_SECRET`, `AUTH_PREVIOUS_KEY_ID`, `AUTH_PREVIOUS_JWT_SECRET` | partner JWT signing keys (current and the one being rotated out) |
+| `ACME_BASE_URL`, `ACME_API_KEY_BRAND_<n>` | Acme Support API and the per-brand keys |
 | `LOG_LEVEL`, `LOG_FORMAT` | `debug`/`info`/`warn`/`error`, `text`/`json` |
+| `DRAIN_DELAY` | how long the pod keeps serving after `/ready` turns unhealthy at shutdown (default `5s`) |
 | `PPROF_ENABLED`, `PPROF_USERNAME`, `PPROF_PASSWORD` | profiler on the internal port |
 | `PUBLIC_ENABLED` | `false` runs the instance as a sync-only worker |
 | `CACHE_ENABLED` | in-process cache of partner lookups (15s TTL) |
@@ -337,7 +340,7 @@ make help              # list all targets
 make test              # unit tests (race detector)
 make test-integration  # integration tests against a throwaway MySQL (see below)
 make build             # build bin/server
-make run               # run on the host with APP_ENV=local (after `make deps-up`)
+make run               # run on the host with config/local.env (after `make deps-up`)
 ```
 
 ### Tests
@@ -362,7 +365,7 @@ make run               # run on the host with APP_ENV=local (after `make deps-up
 ```
 cmd/server/                 entrypoint (+ `healthcheck` subcommand for distroless images)
 internal/app/               composition root: wiring, start-up, graceful shutdown
-internal/config/            per-environment YAML with ${VAR:-default} expansion and validation
+internal/config/            YAML loader with ${VAR:-default} expansion and validation
 internal/domain/            business types and rules (status mapping, amounts, contacts) - no dependencies
 internal/service/           use cases with their ports: transactions (partner API), contactsync (sync)
 internal/adapter/           handler (HTTP in), repository (MySQL), acme (Acme Support client), cache
@@ -370,7 +373,7 @@ internal/auth/              partner JWT verification
 internal/apierror/          the client-facing error model
 internal/platform/          logging, database (pools, WithTx), ratelimit, health, metrics, requestid
 db/                         Flyway migrations + least-privilege user callback (local/test only)
-config/                     local, dev, staging, prod configuration
+config/                     config.yaml (every environment) + local.env (dummy local values)
 scripts/                    seed, tokengen, acmemock (development tools)
 test/integration/           end-to-end tests against the throwaway stack
 deploy/observability/       Prometheus scrape config, Grafana provisioning and dashboard

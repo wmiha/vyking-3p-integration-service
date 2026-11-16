@@ -6,11 +6,17 @@ SHELL := /bin/bash
 APP     := vyking-3p-integration-service
 BIN_DIR := bin
 GO      ?= go
-APP_ENV ?= local
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-export APP_ENV
+# Exports the dummy local values from config/local.env for commands run on the
+# host; variables already set in the shell win (LOG_LEVEL=warn make run).
+# Deliberately not applied to compose targets: its localhost URLs would
+# override the in-network ones.
+LOCAL_ENV := config/local.env
+with-local-env = while IFS='=' read -r k v; do \
+	if [[ $$k =~ ^[A-Za-z_][A-Za-z0-9_]*$$ && -z $${!k+x} ]]; then export "$$k=$$v"; fi; \
+	done < $(LOCAL_ENV);
 
 ##@ Help
 .PHONY: help
@@ -55,8 +61,8 @@ cover: ## Run unit tests with coverage report (coverage.out)
 build: ## Build the server binary into bin/
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/server ./cmd/server
 
-run: ## Run the service on the host against `make deps-up` (APP_ENV=local)
-	$(GO) run -ldflags "-X main.version=$(VERSION)" ./cmd/server
+run: ## Run the service on the host against `make deps-up` (values from config/local.env)
+	@$(with-local-env) $(GO) run -ldflags "-X main.version=$(VERSION)" ./cmd/server
 
 ##@ Docker
 .PHONY: docker-build up deps-up down clean logs ps migrate migrate-info
@@ -99,7 +105,7 @@ seed: ## Load deterministic sample data into the compose database (replaces exis
 
 .PHONY: tokens
 tokens: ## Print partner test tokens (valid, expired, forged, ...) as TOKEN_*=... lines
-	@$(GO) run ./scripts/tokengen -matrix
+	@$(with-local-env) $(GO) run ./scripts/tokengen -matrix
 
 ##@ Observability
 .PHONY: obs-up obs-down

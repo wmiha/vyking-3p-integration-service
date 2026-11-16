@@ -1,7 +1,8 @@
-// Package config loads the service configuration from a per-environment YAML
-// file and expands ${VAR} / ${VAR:-default} placeholders from the process
-// environment, so the same files work locally, in compose and as a mounted
-// Kubernetes ConfigMap with secrets injected as environment variables.
+// Package config loads the service configuration from one YAML file and
+// expands ${VAR} / ${VAR:-default} placeholders from the process environment,
+// so the same file works locally, in compose and as a mounted Kubernetes
+// ConfigMap: what differs per environment, secrets included, arrives as
+// environment variables.
 package config
 
 import (
@@ -10,7 +11,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -18,7 +18,7 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// Supported deployment environments; each has a config/<env>.yaml file.
+// Supported deployment environments (app.env, a label for logs).
 const (
 	EnvLocal   = "local"
 	EnvDev     = "dev"
@@ -28,11 +28,11 @@ const (
 
 var environments = []string{EnvLocal, EnvDev, EnvStaging, EnvProd}
 
-// Environment variables that select the configuration file.
+// VarPath names the environment variable holding the configuration file
+// path; DefaultPath is used when it is unset.
 const (
-	VarEnv  = "APP_ENV"     // local|dev|staging|prod, defaults to local
-	VarDir  = "CONFIG_DIR"  // directory holding <env>.yaml, defaults to "config"
-	VarPath = "CONFIG_PATH" // explicit file path, overrides VarEnv and VarDir
+	VarPath     = "CONFIG_PATH"
+	DefaultPath = "config/config.yaml"
 )
 
 // LookupFunc has the signature of os.LookupEnv and is injected for testing.
@@ -240,30 +240,17 @@ type HTTPServer struct {
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
 }
 
-// Path returns the configuration file to load based on the environment.
+// Path returns the configuration file to load: CONFIG_PATH, or DefaultPath.
 func Path(lookup LookupFunc) string {
 	if p, ok := lookup(VarPath); ok && p != "" {
 		return p
 	}
-	env, ok := lookup(VarEnv)
-	if !ok || env == "" {
-		env = EnvLocal
-	}
-	dir, ok := lookup(VarDir)
-	if !ok || dir == "" {
-		dir = "config"
-	}
-	return filepath.Join(dir, env+".yaml")
+	return DefaultPath
 }
 
 // Load reads, expands, decodes and validates the configuration file selected
 // by Path.
 func Load(lookup LookupFunc) (*Config, error) {
-	if p, _ := lookup(VarPath); p == "" {
-		if env, _ := lookup(VarEnv); env != "" && !slices.Contains(environments, env) {
-			return nil, fmt.Errorf("%s=%q must be one of %s", VarEnv, env, strings.Join(environments, ", "))
-		}
-	}
 	path := Path(lookup)
 	raw, err := os.ReadFile(path)
 	if err != nil {

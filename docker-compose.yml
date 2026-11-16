@@ -79,8 +79,8 @@ services:
       args:
         VERSION: ${VERSION:-dev}
     image: vyking-3p-integration-service:local
+    env_file: config/local.env # dummy local values; `environment` below wins
     environment:
-      APP_ENV: local
       LOG_FORMAT: json
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DB_HOST: mysql

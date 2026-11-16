@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -184,10 +185,9 @@ func TestPath(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		{name: "defaults to local", want: filepath.Join("config", "local.yaml")},
-		{name: "env selects file", env: map[string]string{VarEnv: "staging"}, want: filepath.Join("config", "staging.yaml")},
-		{name: "custom dir", env: map[string]string{VarEnv: "prod", VarDir: "/etc/svc"}, want: filepath.Join("/etc/svc", "prod.yaml")},
-		{name: "explicit path wins", env: map[string]string{VarEnv: "prod", VarPath: "/run/cfg.yaml"}, want: "/run/cfg.yaml"},
+		{name: "default file", want: DefaultPath},
+		{name: "empty path falls back", env: map[string]string{VarPath: ""}, want: DefaultPath},
+		{name: "explicit path wins", env: map[string]string{VarPath: "/run/cfg.yaml"}, want: "/run/cfg.yaml"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -198,41 +198,91 @@ func TestPath(t *testing.T) {
 
 func TestLoad(t *testing.T) {
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "dev.yaml"), []byte(validYAML), 0o600))
+	path := filepath.Join(dir, "cfg.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(validYAML), 0o600))
 
-	cfg, err := Load(mapLookup(map[string]string{VarEnv: "dev", VarDir: dir}))
+	cfg, err := Load(mapLookup(map[string]string{VarPath: path, "APP_ENV": "dev"}))
 	require.NoError(t, err)
 	assert.Equal(t, "svc", cfg.App.Name)
+	assert.Equal(t, EnvDev, cfg.App.Env)
 
-	_, err = Load(mapLookup(map[string]string{VarEnv: "staging", VarDir: dir}))
+	_, err = Load(mapLookup(map[string]string{VarPath: filepath.Join(dir, "missing.yaml")}))
 	require.ErrorContains(t, err, "read config")
 
-	_, err = Load(mapLookup(map[string]string{VarEnv: "../dev", VarDir: dir}))
-	require.ErrorContains(t, err, `APP_ENV="../dev" must be one of local, dev, staging, prod`)
-
-	fixed := filepath.Join(dir, "fixed.yaml")
-	require.NoError(t, os.WriteFile(fixed, []byte(strings.Replace(validYAML, "${APP_ENV:-local}", "dev", 1)), 0o600))
-	cfg, err = Load(mapLookup(map[string]string{VarEnv: "ignored", VarPath: fixed}))
-	require.NoError(t, err, "APP_ENV is irrelevant when CONFIG_PATH is set")
-	assert.Equal(t, "svc", cfg.App.Name)
+	_, err = Load(mapLookup(map[string]string{VarPath: path, "APP_ENV": "qa"}))
+	require.ErrorContains(t, err, `app.env "qa" must be one of local, dev, staging, prod`)
 }
 
-// TestShippedConfigs guards the files in /config against typos and drift.
-func TestShippedConfigs(t *testing.T) {
-	for _, env := range []string{EnvLocal, EnvDev, EnvStaging, EnvProd} {
-		t.Run(env, func(t *testing.T) {
-			cfg, err := Load(mapLookup(map[string]string{
-				VarEnv: env,
-				VarDir: filepath.Join("..", "..", "config"),
-				// Secrets every non-local environment requires.
-				"DB_HOST": "mysql", "DB_NAME": "vyking", "DB_USER": "app", "DB_PASSWORD": "secret",
-				"AUTH_KEY_ID": "2026-11", "AUTH_JWT_SECRET": "prod-like-secret-0123456789-0123456789",
-				"ACME_BASE_URL": "https://api.acme-support.example", "ACME_API_KEY_BRAND_1": "k1",
-			}))
-			require.NoError(t, err)
-			assert.Equal(t, env, cfg.App.Env)
-		})
+// TestShippedConfig guards config/config.yaml and config/local.env against
+// typos and drift, and checks that secrets and endpoints have no defaults.
+func TestShippedConfig(t *testing.T) {
+	shipped := filepath.Join("..", "..", "config", "config.yaml")
+	prodLike := map[string]string{
+		VarPath: shipped, "APP_ENV": EnvProd,
+		"DB_HOST": "mysql", "DB_NAME": "vyking", "DB_USER": "app", "DB_PASSWORD": "secret",
+		"AUTH_KEY_ID": "2026-11", "AUTH_JWT_SECRET": "prod-like-secret-0123456789-0123456789",
+		"ACME_BASE_URL": "https://api.acme-support.example", "ACME_API_KEY_BRAND_1": "k1",
 	}
+
+	t.Run("local", func(t *testing.T) {
+		env := readEnvFile(t, filepath.Join("..", "..", "config", "local.env"))
+		env[VarPath] = shipped
+		cfg, err := Load(mapLookup(env))
+		require.NoError(t, err)
+		assert.Equal(t, EnvLocal, cfg.App.Env)
+		assert.Equal(t, "text", cfg.Log.Format)
+		assert.Zero(t, cfg.Server.DrainDelay)
+		assert.True(t, cfg.Pprof.Enabled)
+		assert.Equal(t, 10, cfg.Database.Primary.Pool.MaxOpenConns)
+		assert.Len(t, cfg.Acme.ConfiguredBrands(), 2, "brand 3 stays unconfigured locally")
+	})
+
+	t.Run("prod defaults", func(t *testing.T) {
+		cfg, err := Load(mapLookup(prodLike))
+		require.NoError(t, err)
+		assert.Equal(t, EnvProd, cfg.App.Env)
+		assert.Equal(t, slog.LevelInfo, cfg.Log.Level)
+		assert.Equal(t, "json", cfg.Log.Format)
+		assert.Equal(t, 5*time.Second, cfg.Server.DrainDelay)
+		assert.False(t, cfg.Pprof.Enabled)
+		assert.False(t, cfg.Database.Replica.Enabled)
+		assert.Equal(t, 40, cfg.Database.Primary.Pool.MaxOpenConns)
+		assert.Equal(t, 20, cfg.Database.Replica.Pool.MaxIdleConns)
+	})
+
+	t.Run("per-environment overrides", func(t *testing.T) {
+		env := maps.Clone(prodLike)
+		env["APP_ENV"], env["DB_POOL_MAX_OPEN"], env["DB_POOL_MAX_IDLE"] = EnvStaging, "20", "10"
+		cfg, err := Load(mapLookup(env))
+		require.NoError(t, err)
+		assert.Equal(t, EnvStaging, cfg.App.Env)
+		assert.Equal(t, 20, cfg.Database.Primary.Pool.MaxOpenConns)
+		assert.Equal(t, 10, cfg.Database.Primary.Pool.MaxIdleConns)
+	})
+
+	t.Run("secrets and endpoints have no defaults", func(t *testing.T) {
+		_, err := Load(mapLookup(map[string]string{VarPath: shipped}))
+		require.EqualError(t, err, "config "+shipped+": missing required environment variables: "+
+			"ACME_BASE_URL, APP_ENV, AUTH_JWT_SECRET, AUTH_KEY_ID, DB_HOST, DB_NAME, DB_PASSWORD, DB_USER")
+	})
+}
+
+// readEnvFile parses KEY=value lines, skipping blank lines and comments.
+func readEnvFile(t *testing.T, path string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	env := map[string]string{}
+	for line := range strings.Lines(string(raw)) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		require.True(t, ok, "not a KEY=value line: %q", line)
+		env[k] = v
+	}
+	return env
 }
 
 func TestPprofValidation(t *testing.T) {

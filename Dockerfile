@@ -39,8 +39,10 @@ ENTRYPOINT ["/acmemock"]
 FROM gcr.io/distroless/static-debian13:nonroot AS server
 WORKDIR /app
 COPY --from=build /out/server /app/server
-COPY config/ /app/config/
-# Safe default: prod config requires every secret to be injected explicitly.
+# Only the YAML: local.env holds dummy values and must never reach an image.
+COPY config/config.yaml /app/config/config.yaml
+# Safe default: the config has no defaults for secrets, so every one of them
+# must be injected explicitly.
 ENV APP_ENV=prod
 EXPOSE 8080 9090
 USER nonroot:nonroot

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Vyking 3P integration (local)",
-    "description": "Local stack in WSL. The collection variable \"host\" defaults to localhost; if that stops working, run `vhost` in PowerShell and paste the WSL IP it copies. Tokens are signed fresh before every request with the dummy local key from config/local.yaml. See docs/LOCAL-RUNBOOK.md.",
+    "description": "Local stack in WSL. The collection variable \"host\" defaults to localhost; if that stops working, run `vhost` in PowerShell and paste the WSL IP it copies. Tokens are signed fresh before every request with the dummy local key from config/local.env. See docs/LOCAL-RUNBOOK.md.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "event": [
@@ -10,7 +10,7 @@
       "script": {
         "type": "text/javascript",
         "exec": [
-          "// Signs fresh local test tokens before every request (HS256, dummy key from config/local.yaml).",
+          "// Signs fresh local test tokens before every request (HS256, dummy key from config/local.env).",
           "const CryptoJS = require('crypto-js');",
           "const kid = pm.collectionVariables.get('jwt_kid');",
           "const secret = pm.collectionVariables.get('jwt_secret');",
@@ -80,12 +80,12 @@
     {
       "key": "jwt_kid",
       "value": "local-1",
-      "description": "auth.keys[0].kid from config/local.yaml"
+      "description": "AUTH_KEY_ID in config/local.env"
     },
     {
       "key": "jwt_secret",
       "value": "local-dev-only-jwt-secret-0123456789",
-      "description": "dummy local secret from config/local.yaml"
+      "description": "dummy AUTH_JWT_SECRET in config/local.env"
     },
     {
       "key": "pprof_user",
