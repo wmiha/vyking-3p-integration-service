@@ -67,7 +67,7 @@ func WithTx(ctx context.Context, db Beginner, fn func(tx *sql.Tx) error, opts ..
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w (%w)", err, ctx.Err())
-		case <-time.After(backoff):
+		case <-time.After(time.Duration(backoff)):
 		}
 	}
 }
